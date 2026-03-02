@@ -171,8 +171,25 @@ build_new_containers() {
             "$independent_ipv6" \
             "$system_type" \
             "$disk_size"
+
+        # 将 onepodman.sh 写出的同名文件内容追加到 ctlog
+        if [[ -f "/root/${container_name}" ]]; then
+            cat "/root/${container_name}" >> "$log_file"
+            rm -f "/root/${container_name}"
+        elif [[ -f "${container_name}" ]]; then
+            cat "${container_name}" >> "$log_file"
+            rm -f "${container_name}"
+        else
+            # 兜底：手动写入
+            echo "${container_name} ${ssh_port} ${passwd} ${cpu_nums} ${memory_nums} ${public_port_start} ${public_port_end} ${disk_size}" >> "$log_file"
+        fi
+        _green "Container ${container_name} logged"
     done
 
+    _green "======================================================"
+    _green "  批量创建完成！所有容器信息已保存到: ${log_file}"
+    _green "======================================================"
+    _blue "查看所有容器: podman ps -a"
     _blue "查看日志文件: cat ${log_file}"
 }
 

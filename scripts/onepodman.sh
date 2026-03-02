@@ -200,14 +200,6 @@ download_and_copy_ssh_scripts() {
     fi
 }
 
-# ======== 构建端口映射参数 ========
-build_port_args() {
-    local ssh_p="$1"
-    local sp="$2"
-    local ep="$3"
-    echo "-p ${ssh_p}:22 -p ${sp}-${ep}:${sp}-${ep}"
-}
-
 # ======== 主逻辑 ========
 main() {
     _blue "Creating container: name=${name} cpu=${cpu} memory=${memory}MB system=${system}"

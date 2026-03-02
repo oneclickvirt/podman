@@ -142,8 +142,16 @@ is_private_ipv6() {
 
 # ======== 网络接口检测 ========
 detect_interface() {
-    interface=$(ip route show default 2>/dev/null | awk '/default/ {print $5; exit}')
-    [[ -z "$interface" ]] && interface=$(ip link show | awk -F: '$0 !~ "lo|vir|^[^0-9]" {print $2; exit}' | tr -d ' ')
+    # 优先用 ip route get 8.8.8.8 获取出口网卡（最精准）
+    interface=$(ip route get 8.8.8.8 2>/dev/null | awk 'NR==1 {for(i=1;i<=NF;i++) if($i=="dev") print $(i+1)}')
+    # 回退：默认路由
+    if [[ -z "$interface" ]]; then
+        interface=$(ip route show default 2>/dev/null | awk '/default/ {print $5; exit}')
+    fi
+    # 再回退：第一个非 lo 接口
+    if [[ -z "$interface" ]]; then
+        interface=$(ip link show | awk '/^[0-9]+: /{gsub(":","",$2); if($2!="lo") {print $2; exit}}')
+    fi
     _blue "Detected interface: ${interface:-unknown}"
     echo "${interface:-}" > /usr/local/bin/podman_main_interface
 }
@@ -152,6 +160,7 @@ detect_interface() {
 check_ipv6() {
     IPV6=""
     IPV6_ENABLED=false
+    # 先从本地网卡检测公网 IPv6
     local candidates
     candidates=$(ip -6 addr show scope global 2>/dev/null | grep "inet6" | awk '{print $2}' | cut -d/ -f1 || true)
     for addr in $candidates; do
@@ -161,6 +170,26 @@ check_ipv6() {
             break
         fi
     done
+    # 本地未检测到时，向外部 API 查询（处理部分 VPS IPv6 无 global scope 的情况）
+    if [[ -z "$IPV6" ]]; then
+        _yellow "No public IPv6 on local interfaces, trying external APIs..."
+        local API_NET=("ipv6.ip.sb" "https://ipget.net" "ipv6.ping0.cc" "https://api.my-ip.io/ip" "https://ipv6.icanhazip.com")
+        for p in "${API_NET[@]}"; do
+            local response
+            response=$(curl -sLk6m8 "$p" 2>/dev/null | tr -d '[:space:]')
+            if [[ $? -eq 0 ]] && [[ -n "$response" ]] && ! echo "$response" | grep -qi "error"; then
+                # 验证是否为合法 IPv6 地址
+                if python3 -c "import ipaddress; ipaddress.IPv6Address('${response}')" 2>/dev/null; then
+                    if ! is_private_ipv6 "$response"; then
+                        IPV6="$response"
+                        IPV6_ENABLED=true
+                        break
+                    fi
+                fi
+            fi
+            sleep 1
+        done
+    fi
     if [[ "$IPV6_ENABLED" == true ]]; then
         _green "Public IPv6 detected: $IPV6"
     else
