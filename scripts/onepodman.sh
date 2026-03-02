@@ -101,13 +101,33 @@ if ! command -v podman >/dev/null 2>&1; then
     exit 1
 fi
 
-# ======== IPv6 检测 ========
+# ======== IPv6 条件检测（三重：网络存在 + ndpresponder 运行 + 地址文件有值）========
 IPV6_ENABLED=false
-if [[ -f /usr/local/bin/podman_ipv6_enabled ]]; then
-    if [[ "$(cat /usr/local/bin/podman_ipv6_enabled)" == "true" ]]; then
-        IPV6_ENABLED=true
+ipv6_address=""
+ipv6_address_without_last_segment=""
+if [[ -f /usr/local/bin/podman_ipv6_enabled ]] && \
+   [[ "$(cat /usr/local/bin/podman_ipv6_enabled)" == "true" ]]; then
+    # 条件1：podman-ipv6 网络存在
+    if podman network exists podman-ipv6 2>/dev/null; then
+        # 条件2：ndpresponder 容器正在运行
+        ndp_status=$(podman inspect -f '{{.State.Status}}' ndpresponder 2>/dev/null || echo "")
+        if [[ "$ndp_status" == "running" ]]; then
+            # 条件3：IPv6 地址文件有值
+            if [[ -f /usr/local/bin/podman_check_ipv6 ]] && \
+               [[ -s /usr/local/bin/podman_check_ipv6 ]]; then
+                ipv6_address=$(cat /usr/local/bin/podman_check_ipv6)
+                ipv6_address_without_last_segment="${ipv6_address%:*}:"
+                IPV6_ENABLED=true
+            fi
+        fi
     fi
 fi
+# 读取公网 IPv4（用于 SSH 连接信息显示）
+host_ipv4=""
+if [[ -f /usr/local/bin/podman_main_ipv4 ]]; then
+    host_ipv4=$(cat /usr/local/bin/podman_main_ipv4)
+fi
+[[ -z "$host_ipv4" ]] && host_ipv4=$(ip -4 addr show scope global 2>/dev/null | awk '/inet / {print $2}' | cut -d/ -f1 | head -n 1)
 
 # ======== lxcfs 检测 ========
 lxcfs_volumes=""
@@ -211,13 +231,8 @@ main() {
     local net_opts=""
     local ipv6_env=""
     if [[ "${independent_ipv6,,}" == "y" ]] && [[ "$IPV6_ENABLED" == "true" ]]; then
-        if podman network exists podman-ipv6 2>/dev/null; then
-            net_opts="--network podman-ipv6"
-            ipv6_env="-e IPV6_ENABLED=true"
-        else
-            _yellow "podman-ipv6 network not found, falling back to podman-net"
-            net_opts="--network podman-net"
-        fi
+        net_opts="--network podman-ipv6"
+        ipv6_env="-e IPV6_ENABLED=true"
     else
         if podman network exists podman-net 2>/dev/null; then
             net_opts="--network podman-net"
@@ -296,13 +311,27 @@ main() {
     echo "$name $sshport $passwd $cpu $memory $startport $endport $disk" >> "${name}"
     cat "${name}"
 
+    # 查询容器实际获得的 IPv6 地址（仅 IPv6 模式）
+    local container_ipv6=""
+    if [[ "${independent_ipv6,,}" == "y" ]] && [[ "$IPV6_ENABLED" == "true" ]]; then
+        container_ipv6=$(podman inspect -f \
+            '{{range .NetworkSettings.Networks}}{{.GlobalIPv6Address}}{{end}}' \
+            "${name}" 2>/dev/null || true)
+        [[ -z "$container_ipv6" ]] && container_ipv6=$(podman inspect -f \
+            '{{range .NetworkSettings.Networks}}{{.IPAddress}}{{end}}' \
+            "${name}" 2>/dev/null | grep -E '^[0-9a-f:]+:[0-9a-f:]+$' | head -1 || true)
+    fi
+
     echo ""
     _green "======================================================"
     _green "  Container: ${name}"
     _green "  System:    ${system}"
-    _green "  SSH:       $(hostname -I 2>/dev/null | awk '{print $1}'):${sshport}"
+    _green "  SSH:       ${host_ipv4}:${sshport}"
     _green "  Password:  ${passwd}"
     _green "  Ports:     ${startport}-${endport}"
+    if [[ -n "$container_ipv6" ]]; then
+        _green "  IPv6:      ${container_ipv6}"
+    fi
     _green "======================================================"
 }
 

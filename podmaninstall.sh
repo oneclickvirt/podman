@@ -154,6 +154,13 @@ detect_interface() {
     fi
     _blue "Detected interface: ${interface:-unknown}"
     echo "${interface:-}" > /usr/local/bin/podman_main_interface
+
+    # 保存宿主机公网 IPv4（供容器创建脚本展示 SSH 连接信息用）
+    if [[ ! -f /usr/local/bin/podman_main_ipv4 ]]; then
+        local main_ipv4
+        main_ipv4=$(ip -4 addr show scope global 2>/dev/null | awk '/inet / {print $2}' | cut -d/ -f1 | head -n 1)
+        echo "${main_ipv4:-}" > /usr/local/bin/podman_main_ipv4
+    fi
 }
 
 # ======== IPv6 检测 ========
@@ -192,8 +199,11 @@ check_ipv6() {
     fi
     if [[ "$IPV6_ENABLED" == true ]]; then
         _green "Public IPv6 detected: $IPV6"
+        # 保存 IPv6 地址供容器创建脚本使用
+        echo "$IPV6" > /usr/local/bin/podman_check_ipv6
     else
         _yellow "No public IPv6 found, skipping IPv6 network setup"
+        echo "" > /usr/local/bin/podman_check_ipv6
     fi
 }
 
