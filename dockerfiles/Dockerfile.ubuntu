@@ -1,0 +1,45 @@
+FROM ubuntu:22.04
+
+ARG DEBIAN_FRONTEND=noninteractive
+
+RUN apt-get update -y && \
+    apt-get install -y --no-install-recommends \
+        openssh-server \
+        sudo \
+        curl \
+        wget \
+        cron \
+        ca-certificates \
+        iproute2 \
+        iputils-ping \
+        net-tools \
+        vim \
+        procps \
+        tzdata \
+        locales \
+    && apt-get clean \
+    && rm -rf /var/lib/apt/lists/*
+
+# 生成 SSH 主机密钥
+RUN ssh-keygen -A
+
+# 配置 sshd
+RUN sed -i 's/^#\?PermitRootLogin.*/PermitRootLogin yes/' /etc/ssh/sshd_config && \
+    sed -i 's/^#\?PasswordAuthentication.*/PasswordAuthentication yes/' /etc/ssh/sshd_config && \
+    sed -i 's/^#\?UsePAM.*/UsePAM yes/' /etc/ssh/sshd_config && \
+    mkdir -p /var/run/sshd
+
+# 设置时区
+RUN ln -sf /usr/share/zoneinfo/UTC /etc/localtime && \
+    echo "UTC" > /etc/timezone
+
+# 更新 motd
+RUN echo 'Related repo https://github.com/oneclickvirt/podman' >> /etc/motd && \
+    echo '--by https://t.me/spiritlhl' >> /etc/motd
+
+COPY entrypoint.sh /entrypoint.sh
+RUN chmod +x /entrypoint.sh
+
+EXPOSE 22
+
+ENTRYPOINT ["/entrypoint.sh"]

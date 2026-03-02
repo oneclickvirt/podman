@@ -1,0 +1,47 @@
+FROM rockylinux:9
+
+RUN dnf update -y && \
+    dnf install -y \
+        openssh-server \
+        sudo \
+        curl \
+        wget \
+        cronie \
+        ca-certificates \
+        iproute \
+        iputils \
+        net-tools \
+        vim \
+        procps-ng \
+        tzdata \
+    && dnf clean all \
+    && rm -rf /var/cache/dnf
+
+# 生成 SSH 主机密钥
+RUN ssh-keygen -A
+
+# 配置 sshd
+RUN sed -i 's/^#\?PermitRootLogin.*/PermitRootLogin yes/' /etc/ssh/sshd_config && \
+    sed -i 's/^#\?PasswordAuthentication.*/PasswordAuthentication yes/' /etc/ssh/sshd_config && \
+    sed -i 's/^#\?UsePAM.*/UsePAM yes/' /etc/ssh/sshd_config && \
+    mkdir -p /var/run/sshd
+
+# 禁用 SELinux（容器内）
+RUN if [ -f /etc/selinux/config ]; then \
+        sed -i 's/^SELINUX=.*/SELINUX=disabled/' /etc/selinux/config; \
+    fi
+
+# 设置时区
+RUN ln -sf /usr/share/zoneinfo/UTC /etc/localtime && \
+    echo "UTC" > /etc/timezone
+
+# 更新 motd
+RUN echo 'Related repo https://github.com/oneclickvirt/podman' >> /etc/motd && \
+    echo '--by https://t.me/spiritlhl' >> /etc/motd
+
+COPY entrypoint.sh /entrypoint.sh
+RUN chmod +x /entrypoint.sh
+
+EXPOSE 22
+
+ENTRYPOINT ["/entrypoint.sh"]

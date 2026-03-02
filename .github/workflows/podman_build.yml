@@ -1,0 +1,246 @@
+name: Build and Push Podman Images
+
+on:
+  push:
+    branches:
+      - main
+    paths:
+      - 'dockerfiles/**'
+      - '.github/workflows/podman_build.yml'
+  workflow_dispatch:
+    inputs:
+      os:
+        description: 'OS to build (leave empty to build all)'
+        required: false
+        default: ''
+        type: choice
+        options:
+          - ''
+          - ubuntu
+          - debian
+          - alpine
+          - almalinux
+          - rockylinux
+          - openeuler
+
+permissions:
+  contents: write
+  packages: write
+
+jobs:
+  build:
+    name: Build ${{ matrix.os }} (${{ matrix.arch }})
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu
+            arch: amd64
+            runner: ubuntu-latest
+            platform: linux/amd64
+          - os: ubuntu
+            arch: arm64
+            runner: ubuntu-latest
+            platform: linux/arm64
+          - os: debian
+            arch: amd64
+            runner: ubuntu-latest
+            platform: linux/amd64
+          - os: debian
+            arch: arm64
+            runner: ubuntu-latest
+            platform: linux/arm64
+          - os: alpine
+            arch: amd64
+            runner: ubuntu-latest
+            platform: linux/amd64
+          - os: alpine
+            arch: arm64
+            runner: ubuntu-latest
+            platform: linux/arm64
+          - os: almalinux
+            arch: amd64
+            runner: ubuntu-latest
+            platform: linux/amd64
+          - os: almalinux
+            arch: arm64
+            runner: ubuntu-latest
+            platform: linux/arm64
+          - os: rockylinux
+            arch: amd64
+            runner: ubuntu-latest
+            platform: linux/amd64
+          - os: rockylinux
+            arch: arm64
+            runner: ubuntu-latest
+            platform: linux/arm64
+          - os: openeuler
+            arch: amd64
+            runner: ubuntu-latest
+            platform: linux/amd64
+          - os: openeuler
+            arch: arm64
+            runner: ubuntu-latest
+            platform: linux/arm64
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Check if this OS should be built
+        id: check
+        run: |
+          INPUT_OS="${{ github.event.inputs.os }}"
+          if [[ -z "$INPUT_OS" || "$INPUT_OS" == "${{ matrix.os }}" ]]; then
+            echo "should_build=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "should_build=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Set up QEMU (for cross-arch builds)
+        if: steps.check.outputs.should_build == 'true'
+        uses: docker/setup-qemu-action@v3
+        with:
+          platforms: arm64,amd64
+
+      - name: Install Podman and Buildah
+        if: steps.check.outputs.should_build == 'true'
+        run: |
+          sudo apt-get update -y
+          sudo apt-get install -y podman buildah qemu-user-static
+
+      - name: Log in to GitHub Container Registry
+        if: steps.check.outputs.should_build == 'true'
+        run: |
+          echo "${{ secrets.GITHUB_TOKEN }}" | podman login ghcr.io \
+            -u "${{ github.actor }}" \
+            --password-stdin
+
+      - name: Build image with Buildah
+        if: steps.check.outputs.should_build == 'true'
+        id: build
+        run: |
+          OS="${{ matrix.os }}"
+          ARCH="${{ matrix.arch }}"
+          PLATFORM="${{ matrix.platform }}"
+          IMAGE_TAG="spiritlhl/${OS}:latest"
+          GHCR_TAG="ghcr.io/${{ github.repository_owner }}/podman:${OS}-${ARCH}"
+
+          echo "Building ${IMAGE_TAG} for platform ${PLATFORM}..."
+
+          buildah build \
+            --platform "${PLATFORM}" \
+            --file "dockerfiles/Dockerfile.${OS}" \
+            --tag "${IMAGE_TAG}" \
+            --tag "${GHCR_TAG}" \
+            dockerfiles/
+
+          echo "image_tag=${IMAGE_TAG}" >> "$GITHUB_OUTPUT"
+          echo "ghcr_tag=${GHCR_TAG}" >> "$GITHUB_OUTPUT"
+
+      - name: Save image as tar.gz (OCI archive)
+        if: steps.check.outputs.should_build == 'true'
+        run: |
+          OS="${{ matrix.os }}"
+          ARCH="${{ matrix.arch }}"
+          TAR_NAME="spiritlhl_${OS}_${ARCH}.tar.gz"
+
+          echo "Saving image to ${TAR_NAME}..."
+          podman save --format oci-archive "${{ steps.build.outputs.image_tag }}" \
+            | gzip > "${TAR_NAME}"
+
+          echo "TAR_NAME=${TAR_NAME}" >> "$GITHUB_ENV"
+          ls -lh "${TAR_NAME}"
+
+      - name: Push image to ghcr.io
+        if: steps.check.outputs.should_build == 'true'
+        run: |
+          GHCR_TAG="${{ steps.build.outputs.ghcr_tag }}"
+          echo "Pushing ${GHCR_TAG}..."
+          podman push "${GHCR_TAG}"
+
+      - name: Upload tar.gz as GitHub Release asset
+        if: steps.check.outputs.should_build == 'true'
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ matrix.os }}
+          name: "${{ matrix.os }} images"
+          body: |
+            Auto-built Podman images for ${{ matrix.os }}.
+
+            ## 使用方法 / Usage
+
+            ### 从 tar.gz 加载 / Load from tar.gz
+            ```bash
+            # amd64
+            curl -L https://github.com/${{ github.repository }}/releases/download/${{ matrix.os }}/spiritlhl_${{ matrix.os }}_amd64.tar.gz \
+              | podman load
+
+            # arm64
+            curl -L https://github.com/${{ github.repository }}/releases/download/${{ matrix.os }}/spiritlhl_${{ matrix.os }}_arm64.tar.gz \
+              | podman load
+            ```
+
+            ### 从 ghcr.io 拉取 / Pull from ghcr.io
+            ```bash
+            podman pull ghcr.io/${{ github.repository_owner }}/podman:${{ matrix.os }}-amd64
+            podman pull ghcr.io/${{ github.repository_owner }}/podman:${{ matrix.os }}-arm64
+            ```
+          files: ${{ env.TAR_NAME }}
+          make_latest: false
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+  # 创建 multi-arch manifest（等所有架构构建完成后）
+  manifest:
+    name: Create multi-arch manifest for ${{ matrix.os }}
+    needs: build
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu, debian, alpine, almalinux, rockylinux, openeuler]
+    steps:
+      - name: Check if this OS should be processed
+        id: check
+        run: |
+          INPUT_OS="${{ github.event.inputs.os }}"
+          if [[ -z "$INPUT_OS" || "$INPUT_OS" == "${{ matrix.os }}" ]]; then
+            echo "should_build=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "should_build=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Install Podman
+        if: steps.check.outputs.should_build == 'true'
+        run: |
+          sudo apt-get update -y
+          sudo apt-get install -y podman
+
+      - name: Log in to GitHub Container Registry
+        if: steps.check.outputs.should_build == 'true'
+        run: |
+          echo "${{ secrets.GITHUB_TOKEN }}" | podman login ghcr.io \
+            -u "${{ github.actor }}" \
+            --password-stdin
+
+      - name: Create and push multi-arch manifest
+        if: steps.check.outputs.should_build == 'true'
+        run: |
+          OS="${{ matrix.os }}"
+          MANIFEST="ghcr.io/${{ github.repository_owner }}/podman:${OS}"
+          AMD64="ghcr.io/${{ github.repository_owner }}/podman:${OS}-amd64"
+          ARM64="ghcr.io/${{ github.repository_owner }}/podman:${OS}-arm64"
+
+          # 删除旧 manifest（若存在）
+          podman manifest rm "${MANIFEST}" 2>/dev/null || true
+
+          # 创建新 manifest
+          podman manifest create "${MANIFEST}"
+          podman manifest add "${MANIFEST}" "${AMD64}"
+          podman manifest add "${MANIFEST}" "${ARM64}"
+
+          # 推送 manifest
+          podman manifest push "${MANIFEST}" "${MANIFEST}"
+          echo "Multi-arch manifest pushed: ${MANIFEST}"

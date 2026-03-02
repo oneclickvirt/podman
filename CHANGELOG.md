@@ -1,0 +1,14 @@
+2026.03.01
+- 初始化仓库，对应 oneclickvirt/containerd 实现 podman 版本
+- 实现 podmaninstall.sh：一键安装 podman + 配置网络、内核参数、DNS保活服务
+- 实现 scripts/onepodman.sh：单个容器开设脚本，支持 ubuntu/debian/alpine/almalinux/rockylinux/openeuler
+- 实现 scripts/create_podman.sh：交互式批量容器开设脚本，记录至 ctlog 日志
+- 实现 scripts/ssh_bash.sh：容器内 SSH 初始化（bash 系统，Debian/Ubuntu/RHEL 系）
+- 实现 scripts/ssh_sh.sh：容器内 SSH 初始化（sh，Alpine 专用）
+- 实现 dockerfiles/ 各系统 Dockerfile + entrypoint 脚本，支持 amd64 和 arm64 双架构
+- 实现 .github/workflows/podman_build.yml：使用 Buildah 自动构建镜像 tar 并发布到 GitHub Releases 及 ghcr.io
+- 支持公网 IPv6 检测，自动创建 podman-ipv6 双栈网络，启动 NDP Responder 实现独立 IPv6
+- 支持国内 CDN 镜像加速（cdn.spiritlhl.net）
+- 支持 lxcfs 挂载（若宿主机安装了 lxcfs，提供容器内真实 /proc 视图）
+- 支持磁盘限制参数（需 overlay on xfs 支持 storage-opt）
+- Podman daemonless 架构，无需 containerd/Docker 守护进程
