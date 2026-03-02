@@ -1,12 +1,8 @@
 name: Build and Push Podman Images
 
 on:
-  push:
-    branches:
-      - main
-    paths:
-      - 'dockerfiles/**'
-      - '.github/workflows/podman_build.yml'
+  schedule:
+    - cron: "0 15 * * *"
   workflow_dispatch:
     inputs:
       os:

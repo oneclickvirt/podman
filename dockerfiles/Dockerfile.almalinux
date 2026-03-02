@@ -1,7 +1,7 @@
 FROM almalinux:9
 
 RUN dnf update -y && \
-    dnf install -y \
+    dnf install -y --allowerasing \
         openssh-server \
         sudo \
         curl \
