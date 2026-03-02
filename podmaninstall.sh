@@ -234,7 +234,13 @@ install_podman() {
     _yellow "Installing Podman..."
 
     if command -v podman >/dev/null 2>&1; then
-        _green "Podman already installed: $(podman --version)"
+        local _pver
+        _pver=$(podman --version 2>/dev/null || true)
+        if [[ -n "$_pver" ]]; then
+            _green "Podman already installed: ${_pver}"
+        else
+            _green "Podman already installed (version check skipped before storage init)"
+        fi
         return 0
     fi
 
@@ -432,46 +438,72 @@ create_ipv6_network() {
         return 0
     fi
 
-    # 计算 /80 子网
+    # 依次尝试 /96 → /80 → /64，选取 netavark 支持的最小前缀
     local prefix=""
-    if command -v python3 >/dev/null 2>&1; then
-        prefix=$(python3 -c "
+    for _plen in 96 80 64; do
+        if command -v python3 >/dev/null 2>&1; then
+            prefix=$(python3 -c "
 import ipaddress, sys
 try:
     addr = ipaddress.ip_address('${ipv6_addr}')
-    net = ipaddress.ip_network(str(addr) + '/80', strict=False)
+    net = ipaddress.ip_network(str(addr) + '/${_plen}', strict=False)
     print(str(net))
 except Exception:
     sys.exit(1)
 " 2>/dev/null || true)
-    fi
-    if [[ -z "$prefix" ]]; then
-        prefix=$(echo "$ipv6_addr" | awk -F: '{print $1":"$2":"$3":"$4"::/80"}')
-    fi
+        fi
+        if [[ -z "$prefix" ]]; then
+            # awk 回退：取前4段作为前缀
+            local _seg4
+            _seg4=$(echo "$ipv6_addr" | awk -F: '{print $1":"$2":"$3":"$4}')
+            prefix="${_seg4}::/${_plen}"
+        fi
+        [[ -n "$prefix" ]] && break
+    done
 
     echo "$prefix" > /usr/local/bin/podman_ipv6_subnet
+    _yellow "IPv6 subnet for podman-ipv6: ${prefix}"
 
-    podman network create \
+    # 尝试1：带 interface-name，--ipv6 先于 subnet（netavark 推荐顺序）
+    if podman network create \
         --driver bridge \
+        --ipv6 \
         --interface-name podman-br1 \
         --subnet 172.21.0.0/16 \
         --gateway 172.21.0.1 \
         --subnet "${prefix}" \
-        --ipv6 \
-        podman-ipv6 2>/dev/null || \
-    podman network create \
+        podman-ipv6 2>/tmp/podman_net_err; then
+        _green "podman-ipv6 created (attempt 1): IPv4=172.21.0.0/16, IPv6=${prefix}"
+        return 0
+    fi
+    _yellow "Attempt 1 failed: $(cat /tmp/podman_net_err 2>/dev/null)"
+
+    # 尝试2：不带 interface-name
+    if podman network create \
         --driver bridge \
+        --ipv6 \
         --subnet 172.21.0.0/16 \
         --gateway 172.21.0.1 \
         --subnet "${prefix}" \
-        --ipv6 \
-        podman-ipv6 2>/dev/null || true
-
-    if podman network exists podman-ipv6 2>/dev/null; then
-        _green "podman-ipv6 created: IPv4=172.21.0.0/16, IPv6=${prefix}"
-    else
-        _yellow "Warning: podman-ipv6 creation may have failed, check manually"
+        podman-ipv6 2>/tmp/podman_net_err; then
+        _green "podman-ipv6 created (attempt 2): IPv4=172.21.0.0/16, IPv6=${prefix}"
+        return 0
     fi
+    _yellow "Attempt 2 failed: $(cat /tmp/podman_net_err 2>/dev/null)"
+
+    # 尝试3：仅 IPv6 子网（不含 IPv4 双栈）
+    if podman network create \
+        --driver bridge \
+        --ipv6 \
+        --subnet "${prefix}" \
+        podman-ipv6 2>/tmp/podman_net_err; then
+        _green "podman-ipv6 created (attempt 3, IPv6-only): IPv6=${prefix}"
+        return 0
+    fi
+    _yellow "Attempt 3 failed: $(cat /tmp/podman_net_err 2>/dev/null)"
+
+    _yellow "Warning: podman-ipv6 creation failed, check manually"
+    return 1
 }
 
 # ======== 启动 NDP Responder ========
@@ -612,8 +644,8 @@ main() {
     detect_interface
     check_ipv6
     install_base_deps
-    install_podman
     configure_podman_storage
+    install_podman
     configure_kernel
     create_podman_network
     setup_podman_socket
