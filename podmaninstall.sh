@@ -329,6 +329,8 @@ EOF
         cat > /etc/containers/storage.conf <<'EOF'
 [storage]
 driver = "overlay"
+runroot = "/run/containers/storage"
+graphRoot = "/var/lib/containers/storage"
 
 [storage.options]
 additionalimagestores = []
@@ -336,6 +338,12 @@ additionalimagestores = []
 [storage.options.overlay]
 mountopt = "nodev"
 EOF
+    else
+        # 已有 storage.conf 但缺少 runroot 时补充必要字段
+        if ! grep -q 'runroot' /etc/containers/storage.conf 2>/dev/null; then
+            sed -i '/^\[storage\]/a runroot = "/run/containers/storage"\ngraphRoot = "/var/lib/containers/storage"' \
+                /etc/containers/storage.conf 2>/dev/null || true
+        fi
     fi
 
     # 配置 registries.conf（添加默认搜索路径）
@@ -385,10 +393,9 @@ create_podman_network() {
 
     podman network create \
         --driver bridge \
-        --opt "com.docker.network.bridge.name=podman-br0" \
+        --interface-name podman-br0 \
         --subnet 172.20.0.0/16 \
         --gateway 172.20.0.1 \
-        --ip-masq \
         podman-net 2>/dev/null || \
     podman network create \
         --driver bridge \
@@ -446,7 +453,7 @@ except Exception:
 
     podman network create \
         --driver bridge \
-        --opt "com.docker.network.bridge.name=podman-br1" \
+        --interface-name podman-br1 \
         --subnet 172.21.0.0/16 \
         --gateway 172.21.0.1 \
         --subnet "${prefix}" \
@@ -477,7 +484,22 @@ start_ndpresponder() {
         *)     arch_tag="x86" ;;
     esac
 
+    local ndp_image="spiritlhl/ndpresponder_${arch_tag}"
+
     podman rm -f ndpresponder 2>/dev/null || true
+
+    # 预先拉取镜像，避免 podman run 超时
+    _yellow "Pulling ndpresponder image: ${ndp_image}"
+    if ! podman pull "${ndp_image}" 2>/dev/null; then
+        # 尝试带 CDN 的 docker.io 路径
+        podman pull "docker.io/${ndp_image}" 2>/dev/null || true
+    fi
+
+    # 确认 podman-ipv6 网络存在后再启动
+    if ! podman network exists podman-ipv6 2>/dev/null; then
+        _yellow "podman-ipv6 network not found, skipping ndpresponder"
+        return 1
+    fi
 
     podman run -d \
         --restart always \
@@ -488,7 +510,7 @@ start_ndpresponder() {
         --cap-add=NET_ADMIN \
         --network host \
         --name ndpresponder \
-        "spiritlhl/ndpresponder_${arch_tag}" \
+        "${ndp_image}" \
         -i "${interface}" -N podman-ipv6 2>/dev/null \
     && _green "NDP responder started" \
     || _yellow "ndpresponder start failed; IPv6 may require manual NDP configuration"
@@ -547,8 +569,17 @@ EOF
 verify_install() {
     _yellow "Verifying installation..."
     if command -v podman >/dev/null 2>&1; then
-        _green "  ✓ podman: $(podman --version)"
-        podman info --format '{{.Host.OCIRuntime.Name}}' 2>/dev/null | xargs -I{} _green "  ✓ OCI runtime: {}" || true
+        local _ver
+        _ver=$(podman --version 2>/dev/null || true)
+        if [[ -n "$_ver" ]]; then
+            _green "  ✓ ${_ver}"
+        else
+            _green "  ✓ podman: installed (run 'podman --version' to verify)"
+        fi
+        # 尝试读取 OCI 运行时（不影响主流程）
+        local _oci
+        _oci=$(podman info --format '{{.Host.OCIRuntime.Name}}' 2>/dev/null || true)
+        [[ -n "$_oci" ]] && _green "  ✓ OCI runtime: ${_oci}"
     else
         _red "  ✗ podman not found"
     fi
