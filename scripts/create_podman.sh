@@ -109,8 +109,20 @@ build_new_containers() {
     reading "每个容器 CPU 核数 (CPU cores per container, e.g. 1 or 0.5) [default: 1]: " cpu_nums
     [[ -z "$cpu_nums" ]] && cpu_nums=1
 
-    reading "磁盘限制(GB) (Disk limit in GB, 0=unlimited) [default: 0]: " disk_size
-    [[ -z "$disk_size" || ! "$disk_size" =~ ^[0-9]+$ ]] && disk_size=0
+    # 询问磁盘限制（仅 btrfs 驱动支持）
+    disk_size=0
+    storage_driver="overlay"
+    if [[ -f /usr/local/bin/podman_storage_driver ]]; then
+        storage_driver=$(cat /usr/local/bin/podman_storage_driver)
+    fi
+    if [[ "$storage_driver" == "btrfs" ]]; then
+        reading "磁盘限制(GB) (Disk limit in GB, 0=unlimited) [default: 0]: " disk_size
+        [[ -z "$disk_size" || ! "$disk_size" =~ ^[0-9]+$ ]] && disk_size=0
+    else
+        _yellow "当前存储驱动($storage_driver)不支持硬盘大小限制，磁盘参数设为0"
+        _yellow "Current storage driver ($storage_driver) does not support disk size limitation, disk set to 0"
+        disk_size=0
+    fi
 
     _blue "可选系统: ubuntu / debian / alpine / almalinux / rockylinux / openeuler"
     reading "选择系统 (Choose system) [default: debian]: " system_type

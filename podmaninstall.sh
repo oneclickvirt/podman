@@ -140,6 +140,100 @@ is_private_ipv6() {
     return 1
 }
 
+# ======== 存储驱动检测与 btrfs 配置 ========
+check_storage_driver_support() {
+    local driver="$1"
+    case "$driver" in
+        "btrfs")
+            if command -v btrfs >/dev/null 2>&1; then
+                modprobe btrfs 2>/dev/null || true
+                return 0
+            fi
+            return 1
+            ;;
+        *) return 1 ;;
+    esac
+}
+
+setup_podman_btrfs_loop() {
+    local pool_size_gb="$1"
+    local loop_file="$2"
+    local mount_point="$3"
+    _yellow "Setting up Podman btrfs loop filesystem..."
+    local loop_dir
+    loop_dir=$(dirname "$loop_file")
+    [[ ! -d "$loop_dir" ]] && mkdir -p "$loop_dir"
+
+    # 若 loop 文件已存在且已挂载，跳过格式化
+    if [[ -f "$loop_file" ]] && losetup -j "$loop_file" 2>/dev/null | grep -q "$loop_file"; then
+        _green "Loop file $loop_file already exists and is attached, skipping creation."
+        local loop_device
+        loop_device=$(losetup -j "$loop_file" | cut -d: -f1)
+        mkdir -p "$mount_point"
+        mount "$loop_device" "$mount_point" 2>/dev/null || true
+        echo "$loop_device" > /usr/local/bin/podman_loop_device
+        echo "$loop_file"   > /usr/local/bin/podman_loop_file
+        echo "$mount_point" > /usr/local/bin/podman_mount_point
+        return 0
+    fi
+
+    if [[ -d "$mount_point" ]] && [[ "$(ls -A "$mount_point" 2>/dev/null)" ]]; then
+        _yellow "Backing up existing Podman data..."
+        mv "$mount_point" "${mount_point}.backup.$(date +%Y%m%d-%H%M%S)"
+    fi
+
+    _yellow "Creating ${pool_size_gb}GB loop file at $loop_file..."
+    fallocate -l "${pool_size_gb}G" "$loop_file"
+    local loop_device
+    loop_device=$(losetup --find --show "$loop_file")
+    _green "Loop device created: $loop_device"
+
+    _yellow "Formatting $loop_device as btrfs..."
+    mkfs.btrfs -f "$loop_device"
+    mkdir -p "$mount_point"
+    mount "$loop_device" "$mount_point"
+    if ! grep -q "$loop_file" /etc/fstab; then
+        echo "$loop_file $mount_point btrfs loop,defaults 0 0" >> /etc/fstab
+    fi
+    chmod 755 "$mount_point"
+    _green "Podman btrfs loop filesystem setup completed"
+    echo "$loop_device" > /usr/local/bin/podman_loop_device
+    echo "$loop_file"   > /usr/local/bin/podman_loop_file
+    echo "$mount_point" > /usr/local/bin/podman_mount_point
+}
+
+try_podman_storage_drivers() {
+    podman_need_disk_limit="false"
+    if [[ -f /usr/local/bin/podman_need_disk_limit ]]; then
+        podman_need_disk_limit=$(cat /usr/local/bin/podman_need_disk_limit)
+    fi
+    if [[ "$podman_need_disk_limit" != "true" ]]; then
+        echo "overlay" > /usr/local/bin/podman_storage_driver
+        _green "Using overlay storage driver (standard, no disk size limitation)"
+        return 0
+    fi
+
+    # 安装 btrfs 工具
+    _yellow "Installing btrfs-progs for disk size limitation support..."
+    case $SYSTEM in
+        Debian|Ubuntu) ${PACKAGE_INSTALL[int]} btrfs-progs 2>/dev/null || true ;;
+        CentOS|Fedora) ${PACKAGE_INSTALL[int]} btrfs-progs 2>/dev/null || true ;;
+        Alpine)        apk add --no-cache btrfs-progs 2>/dev/null || true ;;
+        Arch)          pacman -Sy --noconfirm btrfs-progs 2>/dev/null || true ;;
+    esac
+    modprobe btrfs 2>/dev/null || true
+
+    if check_storage_driver_support "btrfs"; then
+        echo "btrfs" > /usr/local/bin/podman_storage_driver
+        _green "btrfs storage driver available, disk size limitation is supported"
+    else
+        _yellow "btrfs module could not be loaded; a reboot may be required."
+        echo "btrfs" > /usr/local/bin/podman_storage_reboot
+        echo "overlay" > /usr/local/bin/podman_storage_driver
+        _yellow "Falling back to overlay for now. Reboot and re-run to activate btrfs."
+    fi
+}
+
 # ======== 网络接口检测 ========
 detect_interface() {
     # 优先用 ip route get 8.8.8.8 获取出口网卡（最精准）
@@ -300,6 +394,20 @@ configure_podman_storage() {
     _yellow "Configuring Podman storage..."
     mkdir -p /etc/containers
 
+    # 读取存储驱动配置（由 try_podman_storage_drivers 写入）
+    local storage_driver="overlay"
+    if [[ -f /usr/local/bin/podman_storage_driver ]]; then
+        storage_driver=$(cat /usr/local/bin/podman_storage_driver)
+    fi
+
+    # 读取 btrfs 挂载点（存储根目录）
+    local graph_root="/var/lib/containers/storage"
+    if [[ "$storage_driver" == "btrfs" ]] && [[ -f /usr/local/bin/podman_mount_point ]]; then
+        local _mp
+        _mp=$(cat /usr/local/bin/podman_mount_point)
+        [[ -n "$_mp" ]] && graph_root="$_mp"
+    fi
+
     # 配置 containers.conf
     if [[ ! -f /etc/containers/containers.conf ]]; then
         cat > /etc/containers/containers.conf <<'EOF'
@@ -330,13 +438,12 @@ events_logger = "journald"
 EOF
     fi
 
-    # 配置 storage.conf
-    if [[ ! -f /etc/containers/storage.conf ]]; then
-        cat > /etc/containers/storage.conf <<'EOF'
+    # 配置 storage.conf（覆盖写入，确保驱动与路径正确）
+    cat > /etc/containers/storage.conf <<EOF
 [storage]
-driver = "overlay"
+driver = "${storage_driver}"
 runroot = "/run/containers/storage"
-graphRoot = "/var/lib/containers/storage"
+graphRoot = "${graph_root}"
 
 [storage.options]
 additionalimagestores = []
@@ -344,12 +451,11 @@ additionalimagestores = []
 [storage.options.overlay]
 mountopt = "nodev"
 EOF
+
+    if [[ "$storage_driver" == "btrfs" ]]; then
+        _green "Podman storage configured: driver=btrfs, graphRoot=${graph_root}  (disk size limitation ENABLED)"
     else
-        # 已有 storage.conf 但缺少 runroot 时补充必要字段
-        if ! grep -q 'runroot' /etc/containers/storage.conf 2>/dev/null; then
-            sed -i '/^\[storage\]/a runroot = "/run/containers/storage"\ngraphRoot = "/var/lib/containers/storage"' \
-                /etc/containers/storage.conf 2>/dev/null || true
-        fi
+        _green "Podman storage configured: driver=overlay (standard, no disk size limitation)"
     fi
 
     # 配置 registries.conf（添加默认搜索路径）
@@ -644,6 +750,56 @@ main() {
     detect_interface
     check_ipv6
     install_base_deps
+
+    # ======== 硬盘限制支持询问 ========
+    _green "是否需要支持容器硬盘大小限制的Podman环境？（支持btrfs存储驱动）"
+    _green "Do you need Podman with container disk size limitation? (Support btrfs storage driver)"
+    _blue "如果选择 'y'，可以为每个容器限制磁盘空间 / If 'y', you can limit the disk space for each container"
+    _blue "如果选择 'n'，则为标准Podman安装，无磁盘限制 / If 'n', standard Podman installation without disk limits"
+    reading "Do you need container disk size limitation? ([n]/y): " _need_disk_limit_input
+    _green "Where do you want to install Podman storage? (Enter to default: /var/lib/containers/storage):"
+    reading "Podman存储路径？（回车则默认：/var/lib/containers/storage）：" _podman_install_path
+    if [[ -z "$_podman_install_path" ]]; then
+        _podman_install_path="/var/lib/containers/storage"
+    fi
+    echo "$_podman_install_path" > /usr/local/bin/podman_install_path
+
+    if [[ "$_need_disk_limit_input" == "y" || "$_need_disk_limit_input" == "Y" ]]; then
+        echo "true" > /usr/local/bin/podman_need_disk_limit
+        while true; do
+            _green "How large a Podman storage pool is needed? (unit: GB, e.g., enter 20 for 20G):"
+            reading "需要多大的Podman存储池？（单位GB，例如输入20表示20G）：" _podman_pool_size
+            if [[ "$_podman_pool_size" =~ ^[1-9][0-9]*$ ]]; then
+                break
+            else
+                _yellow "Invalid input, please enter a positive integer. / 输入无效，请输入一个正整数。"
+            fi
+        done
+        _green "Where do you want to store the Podman loop file? (Enter to default: /opt/podman-pool.img):"
+        reading "Podman循环文件存储位置？（回车则默认：/opt/podman-pool.img）：" _podman_loop_file
+        if [[ -z "$_podman_loop_file" ]]; then
+            _podman_loop_file="/opt/podman-pool.img"
+        fi
+        _green "将安装支持容器磁盘大小限制的Podman环境（btrfs存储驱动）"
+        _green "Will install Podman with container disk size limitation support (btrfs storage driver)"
+    else
+        echo "false" > /usr/local/bin/podman_need_disk_limit
+        _podman_pool_size=""
+        _podman_loop_file=""
+        _green "将安装标准Podman，无容器磁盘大小限制功能"
+        _green "Will install standard Podman without container disk size limitation"
+    fi
+
+    try_podman_storage_drivers
+
+    # 若需要 btrfs loop 且存储驱动写入了 btrfs，则建立 loop 文件系统
+    _podman_need_disk=$(cat /usr/local/bin/podman_need_disk_limit 2>/dev/null || echo "false")
+    _current_driver=$(cat /usr/local/bin/podman_storage_driver 2>/dev/null || echo "overlay")
+    if [[ "$_podman_need_disk" == "true" ]] && [[ "$_current_driver" == "btrfs" ]] && \
+       [[ -n "$_podman_pool_size" ]] && [[ -n "$_podman_loop_file" ]]; then
+        setup_podman_btrfs_loop "$_podman_pool_size" "$_podman_loop_file" "$_podman_install_path"
+    fi
+
     configure_podman_storage
     install_podman
     configure_kernel

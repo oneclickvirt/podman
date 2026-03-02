@@ -66,6 +66,28 @@ if [[ -f /usr/local/bin/podman_arch ]]; then
     ARCH_TYPE=$(cat /usr/local/bin/podman_arch)
 fi
 
+# ======== 存储驱动检测 ========
+check_storage_driver() {
+    podman_storage_driver="overlay"
+    if [[ -f /usr/local/bin/podman_storage_driver ]]; then
+        podman_storage_driver=$(cat /usr/local/bin/podman_storage_driver)
+    fi
+    if [[ "$podman_storage_driver" == "btrfs" ]]; then
+        btrfs_support="Y"
+        _green "Detected btrfs storage driver, disk size limitation is supported"
+        _green "检测到btrfs存储驱动，支持硬盘大小限制"
+    else
+        btrfs_support="N"
+        if [[ "$disk" != "0" ]]; then
+            _yellow "Current storage driver ($podman_storage_driver) does not support disk size limitation, ignoring disk parameter"
+            _yellow "当前存储驱动($podman_storage_driver)不支持硬盘大小限制，忽略硬盘参数"
+            disk="0"
+        fi
+    fi
+}
+
+check_storage_driver
+
 # ======== CDN ========
 cdn_urls=("https://cdn0.spiritlhl.top/" "http://cdn1.spiritlhl.net/" "http://cdn2.spiritlhl.net/" "http://cdn3.spiritlhl.net/" "http://cdn4.spiritlhl.net/")
 cdn_success_url=""
@@ -241,9 +263,9 @@ main() {
         fi
     fi
 
-    # 磁盘限制选项
+    # 磁盘限制选项（仅 btrfs 驱动支持）
     local storage_opts=""
-    if [[ "$disk" -gt 0 ]]; then
+    if [[ "$btrfs_support" == "Y" ]] && [[ "$disk" -gt 0 ]]; then
         storage_opts="--storage-opt size=${disk}g"
     fi
 
