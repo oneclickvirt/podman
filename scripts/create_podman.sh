@@ -13,6 +13,11 @@ _blue()   { echo -e "\033[36m\033[01m$*\033[0m"; }
 reading() { read -rp "$(_green "$1")" "$2"; }
 export DEBIAN_FRONTEND=noninteractive
 
+WITHOUT_CDN=false
+case "${WITHOUTCDN:-}" in
+    [Tt][Rr][Uu][Ee]|1|[Yy][Ee][Ss]|[Yy]) WITHOUT_CDN=true ;;
+esac
+
 if [ "$(id -u)" != "0" ]; then
     _red "This script must be run as root" 1>&2
     exit 1
@@ -39,6 +44,11 @@ check_cdn() {
 }
 
 check_cdn_file() {
+    if [[ "$WITHOUT_CDN" == "true" ]]; then
+        export cdn_success_url=""
+        _yellow "WITHOUTCDN enabled, CDN acceleration disabled, using direct connection"
+        return
+    fi
     check_cdn "https://raw.githubusercontent.com/spiritLHLS/ecs/main/back/test"
     if [ -n "$cdn_success_url" ]; then
         _yellow "CDN available, using CDN: $cdn_success_url"

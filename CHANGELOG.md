@@ -1,3 +1,8 @@
+2026.03.10
+- 新增环境变量 WITHOUTCDN=TRUE：可完全禁用 CDN 加速
+- 覆盖 podmaninstall.sh、scripts/onepodman.sh、scripts/create_podman.sh
+- 设置后脚本执行过程中不再进行 CDN 探测与 CDN 地址请求，统一走直连地址
+
 2026.03.01
 - 初始化仓库，对应 oneclickvirt/containerd 实现 podman 版本
 - 实现 podmaninstall.sh：一键安装 podman + 配置网络、内核参数、DNS保活服务
