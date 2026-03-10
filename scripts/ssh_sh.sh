@@ -63,7 +63,9 @@ cron_line="* * * * * pgrep -x sshd>/dev/null||/usr/sbin/sshd"
 crond 2>/dev/null || true
 
 # 更新 motd
-echo 'Related repo https://github.com/oneclickvirt/podman' >> /etc/motd
-echo '--by https://t.me/spiritlhl' >> /etc/motd
+grep -qF 'Related repo https://github.com/oneclickvirt/podman' /etc/motd 2>/dev/null || \
+    echo 'Related repo https://github.com/oneclickvirt/podman' >> /etc/motd
+grep -qF '--by https://t.me/spiritlhl' /etc/motd 2>/dev/null || \
+    echo '--by https://t.me/spiritlhl' >> /etc/motd
 
 echo "SSH initialization completed (Alpine)"
