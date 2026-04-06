@@ -762,13 +762,38 @@ main() {
     install_base_deps
 
     # ======== 硬盘限制支持询问 ========
-    _green "是否需要支持容器硬盘大小限制的Podman环境？（支持btrfs存储驱动）"
-    _green "Do you need Podman with container disk size limitation? (Support btrfs storage driver)"
-    _blue "如果选择 'y'，可以为每个容器限制磁盘空间 / If 'y', you can limit the disk space for each container"
-    _blue "如果选择 'n'，则为标准Podman安装，无磁盘限制 / If 'n', standard Podman installation without disk limits"
-    reading "Do you need container disk size limitation? ([n]/y): " _need_disk_limit_input
-    _green "Where do you want to install Podman storage? (Enter to default: /var/lib/containers/storage):"
-    reading "Podman存储路径？（回车则默认：/var/lib/containers/storage）：" _podman_install_path
+    # 支持以下环境变量实现一键安装（跳过所有交互提示）：
+    #   NEED_DISK_LIMIT=y/yes/true/1   是否启用 btrfs 容器磁盘大小限制
+    #   PODMAN_INSTALL_PATH=<path>     Podman 存储路径（默认 /var/lib/containers/storage）
+    #   PODMAN_POOL_SIZE=<整数>        存储池大小，单位 GB（仅 NEED_DISK_LIMIT 启用时有效）
+    #   PODMAN_LOOP_FILE=<path>        loop 镜像文件路径（默认 /opt/podman-pool.img）
+
+    # --- 是否启用磁盘大小限制 ---
+    if [[ -n "${NEED_DISK_LIMIT:-}" ]]; then
+        case "${NEED_DISK_LIMIT}" in
+            [Yy]|[Yy][Ee][Ss]|[Tt][Rr][Uu][Ee]|1)
+                _need_disk_limit_input="y"
+                _yellow "环境变量 NEED_DISK_LIMIT=${NEED_DISK_LIMIT}：启用容器磁盘大小限制" ;;
+            *)
+                _need_disk_limit_input="n"
+                _yellow "环境变量 NEED_DISK_LIMIT=${NEED_DISK_LIMIT}：不启用容器磁盘大小限制" ;;
+        esac
+    else
+        _green "是否需要支持容器硬盘大小限制的Podman环境？（支持btrfs存储驱动）"
+        _green "Do you need Podman with container disk size limitation? (Support btrfs storage driver)"
+        _blue "如果选择 'y'，可以为每个容器限制磁盘空间 / If 'y', you can limit the disk space for each container"
+        _blue "如果选择 'n'，则为标准Podman安装，无磁盘限制 / If 'n', standard Podman installation without disk limits"
+        reading "Do you need container disk size limitation? ([n]/y): " _need_disk_limit_input
+    fi
+
+    # --- Podman 存储路径 ---
+    if [[ -n "${PODMAN_INSTALL_PATH:-}" ]]; then
+        _podman_install_path="${PODMAN_INSTALL_PATH}"
+        _yellow "环境变量 PODMAN_INSTALL_PATH：${_podman_install_path}"
+    else
+        _green "Where do you want to install Podman storage? (Enter to default: /var/lib/containers/storage):"
+        reading "Podman存储路径？（回车则默认：/var/lib/containers/storage）：" _podman_install_path
+    fi
     if [[ -z "$_podman_install_path" ]]; then
         _podman_install_path="/var/lib/containers/storage"
     fi
@@ -776,20 +801,35 @@ main() {
 
     if [[ "$_need_disk_limit_input" == "y" || "$_need_disk_limit_input" == "Y" ]]; then
         echo "true" > /usr/local/bin/podman_need_disk_limit
-        while true; do
-            _green "How large a Podman storage pool is needed? (unit: GB, e.g., enter 20 for 20G):"
-            reading "需要多大的Podman存储池？（单位GB，例如输入20表示20G）：" _podman_pool_size
-            if [[ "$_podman_pool_size" =~ ^[1-9][0-9]*$ ]]; then
-                break
-            else
-                _yellow "Invalid input, please enter a positive integer. / 输入无效，请输入一个正整数。"
-            fi
-        done
-        _green "Where do you want to store the Podman loop file? (Enter to default: /opt/podman-pool.img):"
-        reading "Podman循环文件存储位置？（回车则默认：/opt/podman-pool.img）：" _podman_loop_file
+
+        # --- 存储池大小 ---
+        if [[ -n "${PODMAN_POOL_SIZE:-}" ]] && [[ "${PODMAN_POOL_SIZE}" =~ ^[1-9][0-9]*$ ]]; then
+            _podman_pool_size="${PODMAN_POOL_SIZE}"
+            _yellow "环境变量 PODMAN_POOL_SIZE：${_podman_pool_size}GB"
+        else
+            while true; do
+                _green "How large a Podman storage pool is needed? (unit: GB, e.g., enter 20 for 20G):"
+                reading "需要多大的Podman存储池？（单位GB，例如输入20表示20G）：" _podman_pool_size
+                if [[ "$_podman_pool_size" =~ ^[1-9][0-9]*$ ]]; then
+                    break
+                else
+                    _yellow "Invalid input, please enter a positive integer. / 输入无效，请输入一个正整数。"
+                fi
+            done
+        fi
+
+        # --- loop 文件路径 ---
+        if [[ -n "${PODMAN_LOOP_FILE:-}" ]]; then
+            _podman_loop_file="${PODMAN_LOOP_FILE}"
+            _yellow "环境变量 PODMAN_LOOP_FILE：${_podman_loop_file}"
+        else
+            _green "Where do you want to store the Podman loop file? (Enter to default: /opt/podman-pool.img):"
+            reading "Podman循环文件存储位置？（回车则默认：/opt/podman-pool.img）：" _podman_loop_file
+        fi
         if [[ -z "$_podman_loop_file" ]]; then
             _podman_loop_file="/opt/podman-pool.img"
         fi
+
         _green "将安装支持容器磁盘大小限制的Podman环境（btrfs存储驱动）"
         _green "Will install Podman with container disk size limitation support (btrfs storage driver)"
     else

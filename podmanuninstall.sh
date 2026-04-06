@@ -14,6 +14,12 @@ if [ "$(id -u)" != "0" ]; then
     exit 1
 fi
 
+# 支持环境变量 FORCE_UNINSTALL=true/yes/1/y 跳过确认提示，实现一键卸载
+_skip_confirm=false
+case "${FORCE_UNINSTALL:-}" in
+    [Tt][Rr][Uu][Ee]|1|[Yy][Ee][Ss]|[Yy]) _skip_confirm=true ;;
+esac
+
 echo ""
 echo "======================================================"
 _red "  ⚠  警告：即将卸载 Podman 全套环境"
@@ -21,10 +27,14 @@ echo "  包含：所有运行中/停止的容器、所有镜像、"
 echo "  Podman 网络、辅助服务及状态文件"
 echo "  操作不可逆！"
 echo "======================================================"
-read -rp "$(_yellow "确认卸载？输入 yes 继续，其他任意键退出: ")" confirm
-if [[ "$confirm" != "yes" ]]; then
-    _green "已取消"
-    exit 0
+if [[ "$_skip_confirm" == "true" ]]; then
+    _yellow "环境变量 FORCE_UNINSTALL 已启用，自动跳过确认，继续卸载..."
+else
+    read -rp "$(_yellow "确认卸载？输入 yes 继续，其他任意键退出: ")" confirm
+    if [[ "$confirm" != "yes" ]]; then
+        _green "已取消"
+        exit 0
+    fi
 fi
 
 # ======== 1. 停止并删除所有容器 ========
