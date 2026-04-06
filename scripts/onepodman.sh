@@ -179,7 +179,8 @@ download_and_load_image() {
     local system_type="$1"
     local arch="$ARCH_TYPE"
     local tar_filename="spiritlhl_${system_type}_${arch}.tar.gz"
-    local canonical_image="spiritlhl/${system_type}:latest"
+    # Podman 加载本地 tar 后镜像统一存储在 localhost/ 命名空间下
+    local canonical_image="localhost/spiritlhl/${system_type}:latest"
 
     # 检查本地是否已有镜像
     if podman image exists "${canonical_image}" 2>/dev/null; then
