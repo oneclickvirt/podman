@@ -341,7 +341,7 @@ main() {
     sleep 2
 
     # 记录容器信息
-    echo "$name $sshport $passwd $cpu $memory $startport $endport $disk" >> "${name}"
+    echo "$name $sshport $passwd $cpu $memory $startport $endport $disk" > "${name}"
     cat "${name}"
 
     # 查询容器实际获得的 IPv6 地址（仅 IPv6 模式）

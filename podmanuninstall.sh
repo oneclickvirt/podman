@@ -71,7 +71,7 @@ fi
 
 # ======== 4. 停止 systemd 服务 ========
 _blue "[4/7] 停止并禁用辅助服务..."
-for svc in check-dns-podman podman.socket podman; do
+for svc in check-dns-podman podman-restart podman.socket podman; do
     if systemctl is-active --quiet "$svc" 2>/dev/null; then
         systemctl stop "$svc" 2>/dev/null || true
         _yellow "  已停止 ${svc}"
@@ -106,14 +106,34 @@ done
 
 # ======== 6. 删除状态/辅助文件 ========
 _blue "[6/7] 删除辅助状态文件..."
-for f in \
-    /usr/local/bin/podman_arch \
-    /usr/local/bin/podman_ipv6_enabled \
-    /usr/local/bin/podman_ipv6_subnet \
-    /usr/local/bin/podman_main_interface \
-    /usr/local/bin/check-dns-podman.sh; do
+# 清理 btrfs loop（需要在删除状态文件之前读取）
+if [[ -f /usr/local/bin/podman_mount_point ]]; then
+    _bt_mp=$(cat /usr/local/bin/podman_mount_point 2>/dev/null)
+    if [[ -n "$_bt_mp" ]]; then
+        umount "$_bt_mp" 2>/dev/null || true
+        _yellow "  已卸载 btrfs: $_bt_mp"
+    fi
+fi
+if [[ -f /usr/local/bin/podman_loop_device ]]; then
+    _bt_ld=$(cat /usr/local/bin/podman_loop_device 2>/dev/null)
+    if [[ -n "$_bt_ld" ]]; then
+        losetup -d "$_bt_ld" 2>/dev/null || true
+        _yellow "  已分离 loop 设备: $_bt_ld"
+    fi
+fi
+if [[ -f /usr/local/bin/podman_loop_file ]]; then
+    _bt_lf=$(cat /usr/local/bin/podman_loop_file 2>/dev/null)
+    if [[ -n "$_bt_lf" ]]; then
+        rm -f "$_bt_lf" 2>/dev/null
+        _yellow "  删除 loop 文件: $_bt_lf"
+        sed -i "\|${_bt_lf}|d" /etc/fstab 2>/dev/null || true
+    fi
+fi
+# 删除所有 podman 状态文件
+for f in /usr/local/bin/podman_*; do
     [[ -f "$f" ]] && rm -f "$f" && _yellow "  删除 $f"
 done
+[[ -f /usr/local/bin/check-dns-podman.sh ]] && rm -f /usr/local/bin/check-dns-podman.sh && _yellow "  删除 /usr/local/bin/check-dns-podman.sh"
 rm -f /tmp/spiritlhl_*.tar.gz 2>/dev/null || true
 rm -f /tmp/ssh_bash.sh /tmp/ssh_sh.sh 2>/dev/null || true
 

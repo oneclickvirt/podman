@@ -317,20 +317,44 @@ install_base_deps() {
     case $SYSTEM in
         Debian|Ubuntu)
             eval "${PACKAGE_UPDATE[int]}" 2>/dev/null || true
-            ${PACKAGE_INSTALL[int]} curl wget ca-certificates iptables iproute2 \
+            ${PACKAGE_INSTALL[int]} curl wget ca-certificates nftables iproute2 \
                 socat unzip tar jq 2>/dev/null || true
             ;;
         CentOS|Fedora)
-            ${PACKAGE_INSTALL[int]} curl wget ca-certificates iptables iproute \
+            ${PACKAGE_INSTALL[int]} curl wget ca-certificates nftables iproute \
                 socat unzip tar jq 2>/dev/null || true
             ;;
         Alpine)
             ${PACKAGE_UPDATE[int]} 2>/dev/null || true
-            ${PACKAGE_INSTALL[int]} curl wget ca-certificates iptables iproute2 \
+            ${PACKAGE_INSTALL[int]} curl wget ca-certificates nftables iproute2 \
+                socat unzip tar jq 2>/dev/null || true
+            ;;
+        Arch)
+            ${PACKAGE_UPDATE[int]} 2>/dev/null || true
+            ${PACKAGE_INSTALL[int]} curl wget ca-certificates nftables iproute2 \
                 socat unzip tar jq 2>/dev/null || true
             ;;
     esac
     _green "Base dependencies installed"
+}
+
+# ======== 检测防火墙后端 ========
+detect_firewall_backend() {
+    FIREWALL_BACKEND="nftables"
+    if command -v nft >/dev/null 2>&1 && nft list ruleset >/dev/null 2>&1; then
+        FIREWALL_BACKEND="nftables"
+        _green "Firewall backend: nftables"
+    else
+        _yellow "nftables not functional, falling back to iptables"
+        FIREWALL_BACKEND="iptables"
+        case $SYSTEM in
+            Debian|Ubuntu) ${PACKAGE_INSTALL[int]} iptables 2>/dev/null || true ;;
+            CentOS|Fedora) ${PACKAGE_INSTALL[int]} iptables 2>/dev/null || true ;;
+            Alpine)        ${PACKAGE_INSTALL[int]} iptables 2>/dev/null || true ;;
+            Arch)          ${PACKAGE_INSTALL[int]} iptables 2>/dev/null || true ;;
+        esac
+    fi
+    echo "$FIREWALL_BACKEND" > /usr/local/bin/podman_firewall_backend
 }
 
 # ======== 安装 Podman ========
@@ -419,8 +443,7 @@ configure_podman_storage() {
     fi
 
     # 配置 containers.conf
-    if [[ ! -f /etc/containers/containers.conf ]]; then
-        cat > /etc/containers/containers.conf <<'EOF'
+    cat > /etc/containers/containers.conf <<EOF
 [containers]
 default_capabilities = [
     "CHOWN",
@@ -441,12 +464,12 @@ default_capabilities = [
 
 [network]
 network_backend = "netavark"
+firewall_driver = "${FIREWALL_BACKEND}"
 
 [engine]
 cgroup_manager = "systemd"
 events_logger = "journald"
 EOF
-    fi
 
     # 配置 storage.conf（覆盖写入，确保驱动与路径正确）
     cat > /etc/containers/storage.conf <<EOF
@@ -472,16 +495,28 @@ EOF
     if [[ ! -f /etc/containers/registries.conf ]]; then
         cat > /etc/containers/registries.conf <<'EOF'
 unqualified-search-registries = ["docker.io", "ghcr.io", "quay.io"]
+EOF
+    fi
 
-[[registry]]
-prefix = "docker.io"
-insecure = false
-blocked = false
-
-[[registry]]
-prefix = "ghcr.io"
-insecure = false
-blocked = false
+    # 确保 policy.json 存在
+    if [[ ! -f /etc/containers/policy.json ]]; then
+        cat > /etc/containers/policy.json <<'EOF'
+{
+    "default": [
+        {
+            "type": "insecureAcceptAnything"
+        }
+    ],
+    "transports": {
+        "docker-daemon": {
+            "": [
+                {
+                    "type": "insecureAcceptAnything"
+                }
+            ]
+        }
+    }
+}
 EOF
     fi
 
@@ -496,6 +531,9 @@ configure_kernel() {
     _yellow "Configuring kernel parameters..."
     modprobe overlay 2>/dev/null || true
     modprobe br_netfilter 2>/dev/null || true
+    if [[ "${FIREWALL_BACKEND:-nftables}" == "nftables" ]]; then
+        modprobe nf_tables 2>/dev/null || true
+    fi
     update_sysctl "net.ipv4.ip_forward=1"
     update_sysctl "net.bridge.bridge-nf-call-iptables=1"
     update_sysctl "net.bridge.bridge-nf-call-ip6tables=1"
@@ -670,6 +708,10 @@ setup_podman_socket() {
         systemctl enable --now podman.socket 2>/dev/null || true
         _green "podman.socket enabled"
     fi
+    if systemctl list-unit-files podman-restart.service >/dev/null 2>&1; then
+        systemctl enable podman-restart.service 2>/dev/null || true
+        _green "podman-restart.service enabled (containers with --restart auto-start on boot)"
+    fi
 }
 
 # ======== DNS 保活服务 ========
@@ -760,6 +802,7 @@ main() {
     detect_interface
     check_ipv6
     install_base_deps
+    detect_firewall_backend
 
     # ======== 硬盘限制支持询问 ========
     # 支持以下环境变量实现一键安装（跳过所有交互提示）：
@@ -850,8 +893,8 @@ main() {
         setup_podman_btrfs_loop "$_podman_pool_size" "$_podman_loop_file" "$_podman_install_path"
     fi
 
-    configure_podman_storage
     install_podman
+    configure_podman_storage
     configure_kernel
     create_podman_network
     setup_podman_socket
