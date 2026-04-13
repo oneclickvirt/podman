@@ -343,16 +343,37 @@ detect_firewall_backend() {
     FIREWALL_BACKEND="nftables"
     if command -v nft >/dev/null 2>&1 && nft list ruleset >/dev/null 2>&1; then
         FIREWALL_BACKEND="nftables"
-        _green "Firewall backend: nftables"
+        _green "Firewall backend: nftables (rules auto-persist)"
     else
         _yellow "nftables not functional, falling back to iptables"
         FIREWALL_BACKEND="iptables"
         case $SYSTEM in
-            Debian|Ubuntu) ${PACKAGE_INSTALL[int]} iptables 2>/dev/null || true ;;
-            CentOS|Fedora) ${PACKAGE_INSTALL[int]} iptables 2>/dev/null || true ;;
-            Alpine)        ${PACKAGE_INSTALL[int]} iptables 2>/dev/null || true ;;
-            Arch)          ${PACKAGE_INSTALL[int]} iptables 2>/dev/null || true ;;
+            Debian|Ubuntu)
+                ${PACKAGE_INSTALL[int]} iptables 2>/dev/null || true
+                # iptables-persistent 同时处理 IPv4 和 IPv6 规则持久化
+                _yellow "Installing iptables-persistent for rule persistence..."
+                echo iptables-persistent iptables-persistent/autosave_v4 boolean true | debconf-set-selections
+                echo iptables-persistent iptables-persistent/autosave_v6 boolean true | debconf-set-selections
+                ${PACKAGE_INSTALL[int]} iptables-persistent 2>/dev/null || true
+                systemctl enable netfilter-persistent 2>/dev/null || true
+                ;;
+            CentOS|Fedora)
+                ${PACKAGE_INSTALL[int]} iptables iptables-services 2>/dev/null || true
+                systemctl enable iptables 2>/dev/null || true
+                systemctl enable ip6tables 2>/dev/null || true
+                ;;
+            Alpine)
+                ${PACKAGE_INSTALL[int]} iptables ip6tables iptables-openrc 2>/dev/null || true
+                rc-update add iptables default 2>/dev/null || true
+                rc-update add ip6tables default 2>/dev/null || true
+                ;;
+            Arch)
+                ${PACKAGE_INSTALL[int]} iptables 2>/dev/null || true
+                systemctl enable iptables 2>/dev/null || true
+                systemctl enable ip6tables 2>/dev/null || true
+                ;;
         esac
+        _green "Firewall backend: iptables (with persistent rules for IPv4/IPv6)"
     fi
     echo "$FIREWALL_BACKEND" > /usr/local/bin/podman_firewall_backend
 }

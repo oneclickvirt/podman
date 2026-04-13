@@ -104,6 +104,37 @@ for br in podman-br0 podman-br1; do
     fi
 done
 
+# ======== 5.5. 清理防火墙规则（如果使用 iptables） ========
+if [[ -f /usr/local/bin/podman_firewall_backend ]]; then
+    _fw_backend=$(cat /usr/local/bin/podman_firewall_backend 2>/dev/null || echo "")
+    if [[ "$_fw_backend" == "iptables" ]]; then
+        _blue "[5.5/7] 清理 iptables 规则..."
+        _yellow "  清理 IPv4 规则..."
+        iptables -t nat -F 2>/dev/null || true
+        iptables -t filter -F 2>/dev/null || true
+        iptables -t mangle -F 2>/dev/null || true
+        iptables -X 2>/dev/null || true
+        _yellow "  清理 IPv6 规则..."
+        ip6tables -t nat -F 2>/dev/null || true
+        ip6tables -t filter -F 2>/dev/null || true
+        ip6tables -t mangle -F 2>/dev/null || true
+        ip6tables -X 2>/dev/null || true
+        # 保存清空后的规则
+        if command -v netfilter-persistent >/dev/null 2>&1; then
+            netfilter-persistent save 2>/dev/null || true
+            _green "  iptables 规则已清空并保存"
+        elif command -v service >/dev/null 2>&1; then
+            service iptables save 2>/dev/null || true
+            service ip6tables save 2>/dev/null || true
+            _green "  iptables 规则已清空并保存"
+        elif [[ -d /etc/iptables ]]; then
+            iptables-save > /etc/iptables/rules.v4 2>/dev/null || true
+            ip6tables-save > /etc/iptables/rules.v6 2>/dev/null || true
+            _green "  iptables 规则已清空并保存"
+        fi
+    fi
+fi
+
 # ======== 6. 删除状态/辅助文件 ========
 _blue "[6/7] 删除辅助状态文件..."
 # 清理 btrfs loop（需要在删除状态文件之前读取）
