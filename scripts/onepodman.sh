@@ -10,12 +10,18 @@ _red()    { echo -e "\033[31m\033[01m$*\033[0m"; }
 _green()  { echo -e "\033[32m\033[01m$*\033[0m"; }
 _yellow() { echo -e "\033[33m\033[01m$*\033[0m"; }
 _blue()   { echo -e "\033[36m\033[01m$*\033[0m"; }
+is_truthy() {
+    case "${1:-}" in
+        [Tt][Rr][Uu][Ee]|1|[Yy][Ee][Ss]|[Yy]) return 0 ;;
+        *) return 1 ;;
+    esac
+}
 export DEBIAN_FRONTEND=noninteractive
 
 WITHOUT_CDN=false
-case "${WITHOUTCDN:-}" in
-    [Tt][Rr][Uu][Ee]|1|[Yy][Ee][Ss]|[Yy]) WITHOUT_CDN=true ;;
-esac
+if is_truthy "${WITHOUTCDN:-}"; then
+    WITHOUT_CDN=true
+fi
 
 if [ "$(id -u)" != "0" ]; then
     _red "This script must be run as root" 1>&2
@@ -33,6 +39,93 @@ endport="${7:-35000}"
 independent_ipv6="${8:-N}"
 system="${9:-debian}"
 disk="${10:-0}"
+
+declare -A used_host_ports=()
+
+validate_port() {
+    local value="${1:-}"
+    [[ "$value" =~ ^[0-9]+$ ]] && (( value >= 1 && value <= 65535 ))
+}
+
+mark_used_port_range() {
+    local start="$1"
+    local end="$2"
+    local p
+    [[ "$start" =~ ^[0-9]+$ && "$end" =~ ^[0-9]+$ ]] || return 0
+    (( start >= 1 && end <= 65535 && start <= end )) || return 0
+    for ((p = start; p <= end; p++)); do
+        used_host_ports["$p"]=1
+    done
+}
+
+mark_port_token() {
+    local token="${1:-}"
+    if [[ "$token" =~ ^([0-9]+)-([0-9]+)$ ]]; then
+        mark_used_port_range "${BASH_REMATCH[1]}" "${BASH_REMATCH[2]}"
+    elif [[ "$token" =~ ^[0-9]+$ ]]; then
+        mark_used_port_range "$token" "$token"
+    fi
+}
+
+collect_used_host_ports() {
+    local listen_port port_line mapping
+    used_host_ports=()
+    if command -v ss >/dev/null 2>&1; then
+        while IFS= read -r listen_port; do
+            mark_port_token "$listen_port"
+        done < <(ss -H -tuln 2>/dev/null | awk '{n=split($5,a,":"); p=a[n]; gsub(/[^0-9]/,"",p); if(p!="") print p}' || true)
+    fi
+    if command -v podman >/dev/null 2>&1; then
+        while IFS= read -r port_line; do
+            while IFS= read -r mapping; do
+                [[ -n "$mapping" ]] && mark_port_token "${mapping%->}"
+            done < <(printf '%s\n' "$port_line" | grep -oE '([0-9]{1,5})(-[0-9]{1,5})?->' || true)
+        done < <(podman ps -a --format '{{.Ports}}' 2>/dev/null || true)
+    fi
+}
+
+validate_inputs() {
+    system=$(echo "$system" | tr '[:upper:]' '[:lower:]')
+    if [[ ! "$name" =~ ^[a-zA-Z0-9][a-zA-Z0-9_.-]*$ ]]; then
+        _red "Invalid container name: ${name}"
+        exit 1
+    fi
+    if [[ ! "$cpu" =~ ^[0-9]+([.][0-9]+)?$ || "$cpu" == "0" || "$cpu" == "0.0" ]]; then
+        _red "Invalid CPU value: ${cpu}"
+        exit 1
+    fi
+    if [[ ! "$memory" =~ ^[1-9][0-9]*$ ]]; then
+        _red "Invalid memory value: ${memory}"
+        exit 1
+    fi
+    if [[ -z "$passwd" || "$passwd" =~ [[:space:]] ]]; then
+        _red "Invalid password: password must be non-empty and must not contain whitespace"
+        exit 1
+    fi
+    if ! validate_port "$sshport" || ! validate_port "$startport" || ! validate_port "$endport"; then
+        _red "Invalid port value: ssh=${sshport}, range=${startport}-${endport}"
+        exit 1
+    fi
+    if (( startport > endport )); then
+        _red "Invalid port range: startport must be <= endport"
+        exit 1
+    fi
+    if [[ ! "$disk" =~ ^[0-9]+$ ]]; then
+        _red "Invalid disk value: ${disk}"
+        exit 1
+    fi
+    if [[ ! "$system" =~ ^(ubuntu|debian|alpine|almalinux|rockylinux|openeuler)$ ]]; then
+        _red "Unsupported system: ${system}"
+        exit 1
+    fi
+    if is_truthy "$independent_ipv6"; then
+        independent_ipv6="y"
+    else
+        independent_ipv6="n"
+    fi
+}
+
+validate_inputs
 
 # ======== 系统检测 ========
 REGEX=("debian" "ubuntu" "centos|red hat|kernel|oracle linux|alma|rocky" "'amazon linux'" "fedora" "arch" "alpine")
@@ -93,6 +186,31 @@ check_storage_driver() {
 
 check_storage_driver
 
+# ======== 检查 Podman 与资源冲突 ========
+if ! command -v podman >/dev/null 2>&1; then
+    _red "podman not found. Please run podmaninstall.sh first."
+    exit 1
+fi
+
+if ! is_truthy "${PODMAN_SKIP_RESOURCE_CHECK:-}"; then
+    if podman container exists "$name" 2>/dev/null; then
+        _red "Container ${name} already exists"
+        exit 1
+    fi
+
+    collect_used_host_ports
+    if [[ -n "${used_host_ports[$sshport]:-}" ]]; then
+        _red "SSH host port ${sshport} is already in use"
+        exit 1
+    fi
+    for ((port = startport; port <= endport; port++)); do
+        if [[ -n "${used_host_ports[$port]:-}" ]]; then
+            _red "Public host port ${port} is already in use"
+            exit 1
+        fi
+    done
+fi
+
 # ======== CDN ========
 cdn_urls=("https://cdn0.spiritlhl.top/" "http://cdn1.spiritlhl.net/" "http://cdn2.spiritlhl.net/" "http://cdn3.spiritlhl.net/" "http://cdn4.spiritlhl.net/")
 cdn_success_url=""
@@ -126,12 +244,6 @@ check_cdn_file() {
 }
 
 check_cdn_file
-
-# ======== 检查 Podman ========
-if ! command -v podman >/dev/null 2>&1; then
-    _red "podman not found. Please run podmaninstall.sh first."
-    exit 1
-fi
 
 # ======== IPv6 条件检测（三重：网络存在 + ndpresponder 运行 + 地址文件有值）========
 IPV6_ENABLED=false
@@ -175,6 +287,32 @@ for dir in /var/lib/lxcfs/proc /var/lib/lxcfs; do
 done
 
 # ======== 下载并加载镜像 ========
+tag_loaded_image() {
+    local system_type="$1"
+    local canonical_image="$2"
+    local load_output="$3"
+    local ref
+    local candidates=(
+        "localhost/spiritlhl/${system_type}:latest"
+        "spiritlhl/${system_type}:latest"
+        "docker.io/spiritlhl/${system_type}:latest"
+    )
+
+    for ref in "${candidates[@]}"; do
+        if podman image exists "$ref" 2>/dev/null; then
+            podman tag "$ref" "$canonical_image" 2>/dev/null || true
+            return 0
+        fi
+    done
+
+    ref=$(printf '%s\n' "$load_output" | awk -F': ' '/Loaded image/ {print $NF; exit}')
+    if [[ -n "$ref" ]] && podman image exists "$ref" 2>/dev/null; then
+        podman tag "$ref" "$canonical_image" 2>/dev/null || true
+        return 0
+    fi
+    return 1
+}
+
 download_and_load_image() {
     local system_type="$1"
     local arch="$ARCH_TYPE"
@@ -197,14 +335,17 @@ download_and_load_image() {
     if curl -L --connect-timeout 15 --max-time 600 -o "/tmp/${tar_filename}" "$download_url" && \
        [[ -f "/tmp/${tar_filename}" ]] && [[ -s "/tmp/${tar_filename}" ]]; then
         _yellow "Loading image from tar..."
-        if podman load -i "/tmp/${tar_filename}"; then
+        local load_output
+        if load_output=$(podman load -i "/tmp/${tar_filename}" 2>&1); then
+            printf '%s\n' "$load_output"
             rm -f "/tmp/${tar_filename}"
-            # 确保以 spiritlhl/<os>:latest 标记
+            # 确保以 localhost/spiritlhl/<os>:latest 标记；只使用加载结果或已知候选 tag。
             if ! podman image exists "${canonical_image}" 2>/dev/null; then
-                # 找到刚加载的镜像并打标签
-                local loaded_id
-                loaded_id=$(podman images --format "{{.ID}}" | head -1)
-                [[ -n "$loaded_id" ]] && podman tag "$loaded_id" "${canonical_image}" 2>/dev/null || true
+                tag_loaded_image "$system_type" "$canonical_image" "$load_output" || true
+            fi
+            if ! podman image exists "${canonical_image}" 2>/dev/null; then
+                _red "Loaded image could not be resolved for ${system_type}"
+                exit 1
             fi
             export image_name="${canonical_image}"
             _green "Image loaded: ${image_name}"
@@ -237,20 +378,26 @@ download_and_copy_ssh_scripts() {
     local cname="$1"
     local sys_type="$2"
     local base_url="${cdn_success_url}https://raw.githubusercontent.com/oneclickvirt/podman/main/scripts"
+    local tmp_file
 
     if [[ "$sys_type" == "alpine" ]]; then
+        tmp_file="/tmp/podman_${cname}_ssh_sh.sh"
+        rm -f "$tmp_file" 2>/dev/null || true
         curl -sL --connect-timeout 10 --max-time 30 \
-            "${base_url}/ssh_sh.sh" -o /tmp/ssh_sh.sh 2>/dev/null || true
-        if [[ -f /tmp/ssh_sh.sh ]]; then
-            podman cp /tmp/ssh_sh.sh "${cname}:/ssh_sh.sh" 2>/dev/null || true
+            "${base_url}/ssh_sh.sh" -o "$tmp_file" 2>/dev/null || true
+        if [[ -s "$tmp_file" ]]; then
+            podman cp "$tmp_file" "${cname}:/ssh_sh.sh" 2>/dev/null || true
         fi
     else
+        tmp_file="/tmp/podman_${cname}_ssh_bash.sh"
+        rm -f "$tmp_file" 2>/dev/null || true
         curl -sL --connect-timeout 10 --max-time 30 \
-            "${base_url}/ssh_bash.sh" -o /tmp/ssh_bash.sh 2>/dev/null || true
-        if [[ -f /tmp/ssh_bash.sh ]]; then
-            podman cp /tmp/ssh_bash.sh "${cname}:/ssh_bash.sh" 2>/dev/null || true
+            "${base_url}/ssh_bash.sh" -o "$tmp_file" 2>/dev/null || true
+        if [[ -s "$tmp_file" ]]; then
+            podman cp "$tmp_file" "${cname}:/ssh_bash.sh" 2>/dev/null || true
         fi
     fi
+    rm -f "$tmp_file" 2>/dev/null || true
 }
 
 # ======== 主逻辑 ========
@@ -316,18 +463,18 @@ main() {
 
     if [[ "$system" == "alpine" ]]; then
         if podman exec "${name}" test -f /ssh_sh.sh 2>/dev/null; then
-            podman exec "${name}" sh -c "sh /ssh_sh.sh '${passwd}'" 2>/dev/null || true
+            podman exec -e ROOT_PASSWORD="${passwd}" "${name}" sh -c 'sh /ssh_sh.sh "$ROOT_PASSWORD"' 2>/dev/null || true
         else
             _yellow "ssh_sh.sh not found in container, relying on built-in entrypoint"
         fi
-        podman exec "${name}" sh -c "echo 'root:${passwd}' | chpasswd" 2>/dev/null || true
+        podman exec -e ROOT_PASSWORD="${passwd}" "${name}" sh -c 'printf "%s\n" "root:${ROOT_PASSWORD}" | chpasswd' 2>/dev/null || true
     else
         if podman exec "${name}" test -f /ssh_bash.sh 2>/dev/null; then
-            podman exec "${name}" bash -c "bash /ssh_bash.sh '${passwd}'" 2>/dev/null || true
+            podman exec -e ROOT_PASSWORD="${passwd}" "${name}" bash -c 'bash /ssh_bash.sh "$ROOT_PASSWORD"' 2>/dev/null || true
         else
             _yellow "ssh_bash.sh not found in container, relying on built-in entrypoint"
         fi
-        podman exec "${name}" bash -c "echo 'root:${passwd}' | chpasswd" 2>/dev/null || true
+        podman exec -e ROOT_PASSWORD="${passwd}" "${name}" bash -c 'printf "%s\n" "root:${ROOT_PASSWORD}" | chpasswd' 2>/dev/null || true
     fi
 
     # 尝试启动 sshd（若 entrypoint 未自动启动）

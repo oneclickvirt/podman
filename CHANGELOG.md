@@ -1,3 +1,15 @@
+2026.06.02
+- 统一使用 `noninteractive=true` 作为安装、批量创建、卸载的无交互开关
+- 批量创建支持环境变量传参，并一次性收集容器名与端口占用，避免重复查询
+- 修复批量创建失败后仍写入 ctlog 的问题
+- 修复镜像 tar 加载后可能错误标记本地其他镜像的问题
+- 加强单容器创建的参数、端口、容器名、密码传递边界校验
+- 修复 btrfs loop 重跑安装时可能覆盖已有 loop 文件的问题
+- 修正 IPv6 网络 `/96`、`/80`、`/64` 前缀回退逻辑
+- 调整安装流程，先安装基础依赖再检测网络与 IPv6，并兼容 `python`/`python3`
+- 修复 IPv6 网络或 NDP responder 启动失败时仍写入启用状态的问题
+- 卸载时保留非 Podman iptables 规则，仅持久化 Podman 网络删除后的当前状态
+
 2026.03.10
 - 新增环境变量 WITHOUTCDN=TRUE：可完全禁用 CDN 加速
 - 覆盖 podmaninstall.sh、scripts/onepodman.sh、scripts/create_podman.sh

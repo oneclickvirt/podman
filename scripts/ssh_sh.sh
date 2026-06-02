@@ -32,13 +32,28 @@ mkdir -p /etc/ssh
 ssh-keygen -A 2>/dev/null || true
 
 # 配置 sshd
+set_sshd_option() {
+    config_file="$1"
+    option="$2"
+    value="$3"
+    if grep -qE "^#?${option}[[:space:]]+" "$config_file"; then
+        sed -i "s/^#\?${option}.*/${option} ${value}/" "$config_file"
+    else
+        echo "${option} ${value}" >> "$config_file"
+    fi
+}
+
 config_file="/etc/ssh/sshd_config"
 if [ -f "$config_file" ]; then
-    sed -i '/^#PermitRootLogin\|PermitRootLogin/c PermitRootLogin yes' "$config_file"
-    sed -i '/^#PasswordAuthentication\|PasswordAuthentication/c PasswordAuthentication yes' "$config_file"
-    sed -i '/^#PubkeyAuthentication\|PubkeyAuthentication/c PubkeyAuthentication yes' "$config_file"
-    sed -i 's/#ListenAddress 0.0.0.0/ListenAddress 0.0.0.0/' "$config_file"
-    sed -i 's/#Port 22/Port 22/' "$config_file"
+    set_sshd_option "$config_file" "PermitRootLogin" "yes"
+    set_sshd_option "$config_file" "PasswordAuthentication" "yes"
+    set_sshd_option "$config_file" "PubkeyAuthentication" "yes"
+    set_sshd_option "$config_file" "Port" "22"
+    if grep -qE '^#?ListenAddress[[:space:]]+0\.0\.0\.0' "$config_file"; then
+        sed -i 's/^#\?ListenAddress[[:space:]]\+0\.0\.0\.0/ListenAddress 0.0.0.0/' "$config_file"
+    else
+        echo "ListenAddress 0.0.0.0" >> "$config_file"
+    fi
 fi
 
 # 修复 cloud-init

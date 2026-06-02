@@ -19,6 +19,24 @@
 bash <(wget -qO- https://raw.githubusercontent.com/oneclickvirt/podman/main/podmaninstall.sh)
 ```
 
+无交互安装可使用：
+
+```bash
+export noninteractive=true
+bash <(wget -qO- https://raw.githubusercontent.com/oneclickvirt/podman/main/podmaninstall.sh)
+```
+
+可选环境变量：
+
+| 变量 | 说明 | 默认值 |
+|------|------|--------|
+| noninteractive | 设为 true 时跳过所有交互提示 | false |
+| WITHOUTCDN | 设为 true 时禁用 CDN 探测与加速 | false |
+| NEED_DISK_LIMIT | 是否启用 btrfs 容器磁盘限制 | n |
+| PODMAN_INSTALL_PATH | Podman 存储路径 | /var/lib/containers/storage |
+| PODMAN_POOL_SIZE | btrfs loop 存储池大小 GB | 20 |
+| PODMAN_LOOP_FILE | btrfs loop 镜像文件路径 | /opt/podman-pool.img |
+
 ## 开设单个容器
 
 ```bash
@@ -58,6 +76,33 @@ chmod +x create_podman.sh
 
 交互式脚本，自动递增容器名（ct1, ct2, ...）、SSH 端口、公网端口，容器信息记录到 `ctlog` 文件。
 
+无交互批量创建示例：
+
+```bash
+export noninteractive=true
+export PODMAN_CREATE_COUNT=3
+export PODMAN_MEMORY_MB=512
+export PODMAN_CPU=1
+export PODMAN_SYSTEM=debian
+export PODMAN_IPV6=n
+./create_podman.sh
+```
+
+批量创建时支持的环境变量：
+
+| 变量 | 说明 | 默认值 |
+|------|------|--------|
+| PODMAN_CREATE_COUNT | 新增容器数量，也兼容 PODMAN_CREATE_NUMS | 1 |
+| PODMAN_MEMORY_MB | 每个容器内存 MB | 512 |
+| PODMAN_CPU | 每个容器 CPU 核数 | 1 |
+| PODMAN_DISK_GB | 每个容器磁盘限制 GB，仅 btrfs 可用 | 0 |
+| PODMAN_SYSTEM | 容器系统 | debian |
+| PODMAN_IPV6 | 是否分配独立 IPv6 | n |
+| PODMAN_CONTAINER_PREFIX | 容器名前缀 | ct |
+| PODMAN_CONTAINER_START_NUM | 第一个容器编号 | 从 ctlog 续接 |
+| PODMAN_START_SSH_PORT | 第一个 SSH 宿主机端口 | 从 ctlog 续接 |
+| PODMAN_PUBLIC_PORT_START | 第一个公网映射端口 | 从 ctlog 续接 |
+
 ## 查看与管理容器
 
 ```bash
@@ -78,7 +123,7 @@ podman rmi <image>            # 删除镜像
 bash <(wget -qO- https://raw.githubusercontent.com/oneclickvirt/podman/main/podmanuninstall.sh)
 ```
 
-脚本会在执行前要求输入 `yes` 确认，操作不可逆。
+脚本会在执行前要求输入 `yes` 确认，操作不可逆。无交互卸载可先执行 `export noninteractive=true`，也兼容 `FORCE_UNINSTALL=true`。
 
 ## 镜像说明
 

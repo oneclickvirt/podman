@@ -8,6 +8,25 @@ _red()    { echo -e "\033[31m\033[01m$*\033[0m"; }
 _green()  { echo -e "\033[32m\033[01m$*\033[0m"; }
 _yellow() { echo -e "\033[33m\033[01m$*\033[0m"; }
 _blue()   { echo -e "\033[36m\033[01m$*\033[0m"; }
+is_truthy() {
+    case "${1:-}" in
+        [Tt][Rr][Uu][Ee]|1|[Yy][Ee][Ss]|[Yy]) return 0 ;;
+        *) return 1 ;;
+    esac
+}
+is_noninteractive() {
+    is_truthy "${noninteractive:-${NONINTERACTIVE:-}}"
+}
+remove_fstab_entry() {
+    local needle="$1"
+    local tmp_file
+    [[ -f /etc/fstab && -n "$needle" ]] || return 0
+    tmp_file=$(mktemp /tmp/podman-fstab.XXXXXX 2>/dev/null || true)
+    [[ -n "$tmp_file" ]] || return 0
+    grep -Fv -- "$needle" /etc/fstab > "$tmp_file" 2>/dev/null || true
+    cp "$tmp_file" /etc/fstab 2>/dev/null || true
+    rm -f "$tmp_file" 2>/dev/null || true
+}
 
 if [ "$(id -u)" != "0" ]; then
     _red "This script must be run as root"
@@ -16,9 +35,9 @@ fi
 
 # 支持环境变量 FORCE_UNINSTALL=true/yes/1/y 跳过确认提示，实现一键卸载
 _skip_confirm=false
-case "${FORCE_UNINSTALL:-}" in
-    [Tt][Rr][Uu][Ee]|1|[Yy][Ee][Ss]|[Yy]) _skip_confirm=true ;;
-esac
+if is_truthy "${FORCE_UNINSTALL:-}" || is_noninteractive; then
+    _skip_confirm=true
+fi
 
 echo ""
 echo "======================================================"
@@ -28,7 +47,11 @@ echo "  Podman 网络、辅助服务及状态文件"
 echo "  操作不可逆！"
 echo "======================================================"
 if [[ "$_skip_confirm" == "true" ]]; then
-    _yellow "环境变量 FORCE_UNINSTALL 已启用，自动跳过确认，继续卸载..."
+    if is_noninteractive; then
+        _yellow "noninteractive=true 已启用，自动跳过确认，继续卸载..."
+    else
+        _yellow "环境变量 FORCE_UNINSTALL 已启用，自动跳过确认，继续卸载..."
+    fi
 else
     read -rp "$(_yellow "确认卸载？输入 yes 继续，其他任意键退出: ")" confirm
     if [[ "$confirm" != "yes" ]]; then
@@ -104,33 +127,23 @@ for br in podman-br0 podman-br1; do
     fi
 done
 
-# ======== 5.5. 清理防火墙规则（如果使用 iptables） ========
+# ======== 5.5. 持久化防火墙规则（如果使用 iptables） ========
 if [[ -f /usr/local/bin/podman_firewall_backend ]]; then
     _fw_backend=$(cat /usr/local/bin/podman_firewall_backend 2>/dev/null || echo "")
     if [[ "$_fw_backend" == "iptables" ]]; then
-        _blue "[5.5/7] 清理 iptables 规则..."
-        _yellow "  清理 IPv4 规则..."
-        iptables -t nat -F 2>/dev/null || true
-        iptables -t filter -F 2>/dev/null || true
-        iptables -t mangle -F 2>/dev/null || true
-        iptables -X 2>/dev/null || true
-        _yellow "  清理 IPv6 规则..."
-        ip6tables -t nat -F 2>/dev/null || true
-        ip6tables -t filter -F 2>/dev/null || true
-        ip6tables -t mangle -F 2>/dev/null || true
-        ip6tables -X 2>/dev/null || true
-        # 保存清空后的规则
+        _blue "[5.5/7] 保存 iptables 当前规则..."
+        _yellow "  Podman 网络已删除，保留非 Podman 防火墙规则，仅持久化当前状态"
         if command -v netfilter-persistent >/dev/null 2>&1; then
             netfilter-persistent save 2>/dev/null || true
-            _green "  iptables 规则已清空并保存"
+            _green "  iptables 当前规则已保存"
         elif command -v service >/dev/null 2>&1; then
             service iptables save 2>/dev/null || true
             service ip6tables save 2>/dev/null || true
-            _green "  iptables 规则已清空并保存"
+            _green "  iptables 当前规则已保存"
         elif [[ -d /etc/iptables ]]; then
             iptables-save > /etc/iptables/rules.v4 2>/dev/null || true
             ip6tables-save > /etc/iptables/rules.v6 2>/dev/null || true
-            _green "  iptables 规则已清空并保存"
+            _green "  iptables 当前规则已保存"
         fi
     fi
 fi
@@ -157,7 +170,7 @@ if [[ -f /usr/local/bin/podman_loop_file ]]; then
     if [[ -n "$_bt_lf" ]]; then
         rm -f "$_bt_lf" 2>/dev/null
         _yellow "  删除 loop 文件: $_bt_lf"
-        sed -i "\|${_bt_lf}|d" /etc/fstab 2>/dev/null || true
+        remove_fstab_entry "$_bt_lf"
     fi
 fi
 # 删除所有 podman 状态文件

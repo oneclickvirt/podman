@@ -15,6 +15,7 @@ if [ -d "$config_dir" ]; then
     for file in "${config_dir}"*; do
         [ -f "$file" ] || continue
         sed -i 's/PasswordAuthentication no/PasswordAuthentication yes/g' "$file" 2>/dev/null || true
+        sed -i 's/PermitRootLogin no/PermitRootLogin yes/g' "$file" 2>/dev/null || true
         sed -i 's/PermitRootLogin prohibit-password/PermitRootLogin yes/g' "$file" 2>/dev/null || true
     done
 fi
@@ -22,8 +23,16 @@ fi
 # 确保 sshd_config 配置正确
 sshd_cfg="/etc/ssh/sshd_config"
 if [ -f "$sshd_cfg" ]; then
-    sed -i 's/^#\?PermitRootLogin.*/PermitRootLogin yes/' "$sshd_cfg"
-    sed -i 's/^#\?PasswordAuthentication.*/PasswordAuthentication yes/' "$sshd_cfg"
+    if grep -qE '^#?PermitRootLogin[[:space:]]+' "$sshd_cfg"; then
+        sed -i 's/^#\?PermitRootLogin.*/PermitRootLogin yes/' "$sshd_cfg"
+    else
+        echo "PermitRootLogin yes" >> "$sshd_cfg"
+    fi
+    if grep -qE '^#?PasswordAuthentication[[:space:]]+' "$sshd_cfg"; then
+        sed -i 's/^#\?PasswordAuthentication.*/PasswordAuthentication yes/' "$sshd_cfg"
+    else
+        echo "PasswordAuthentication yes" >> "$sshd_cfg"
+    fi
 fi
 
 # 确保 SSH 主机密钥存在

@@ -7,13 +7,28 @@ _red()    { echo -e "\033[31m\033[01m$*\033[0m"; }
 _green()  { echo -e "\033[32m\033[01m$*\033[0m"; }
 _yellow() { echo -e "\033[33m\033[01m$*\033[0m"; }
 _blue()   { echo -e "\033[36m\033[01m$*\033[0m"; }
-reading() { read -rp "$(_green "$1")" "$2"; }
+is_truthy() {
+    case "${1:-}" in
+        [Tt][Rr][Uu][Ee]|1|[Yy][Ee][Ss]|[Yy]) return 0 ;;
+        *) return 1 ;;
+    esac
+}
+is_noninteractive() {
+    is_truthy "${noninteractive:-${NONINTERACTIVE:-}}"
+}
+python_cmd() {
+    command -v python3 2>/dev/null || command -v python 2>/dev/null || true
+}
+reading() {
+    is_noninteractive && return 1
+    read -rp "$(_green "$1")" "$2"
+}
 export DEBIAN_FRONTEND=noninteractive
 
 WITHOUT_CDN=false
-case "${WITHOUTCDN:-}" in
-    [Tt][Rr][Uu][Ee]|1|[Yy][Ee][Ss]|[Yy]) WITHOUT_CDN=true ;;
-esac
+if is_truthy "${WITHOUTCDN:-}"; then
+    WITHOUT_CDN=true
+fi
 
 utf8_locale=$(locale -a 2>/dev/null | grep -i -m 1 -E "UTF-8|utf8")
 if [[ -z "$utf8_locale" ]]; then
@@ -133,8 +148,9 @@ check_cdn_file
 update_sysctl() {
     local key="${1%%=*}"
     local val="${1##*=}"
-    if grep -q "^${key}" /etc/sysctl.conf 2>/dev/null; then
-        sed -i "s|^${key}.*|${key}=${val}|g" /etc/sysctl.conf
+    local escaped_key="${key//./\\.}"
+    if grep -qE "^${escaped_key}[[:space:]]*=" /etc/sysctl.conf 2>/dev/null; then
+        sed -i -E "s|^${escaped_key}[[:space:]]*=.*|${key}=${val}|g" /etc/sysctl.conf
     else
         echo "${key}=${val}" >> /etc/sysctl.conf
     fi
@@ -174,15 +190,47 @@ setup_podman_btrfs_loop() {
     loop_dir=$(dirname "$loop_file")
     [[ ! -d "$loop_dir" ]] && mkdir -p "$loop_dir"
 
-    # 若 loop 文件已存在且已挂载，跳过格式化
-    if [[ -f "$loop_file" ]] && losetup -j "$loop_file" 2>/dev/null | grep -q "$loop_file"; then
-        _green "Loop file $loop_file already exists and is attached, skipping creation."
+    # 若 loop 文件已存在，优先尝试复用，避免重跑安装时覆盖已有容器数据。
+    if [[ -f "$loop_file" ]]; then
         local loop_device
-        loop_device=$(losetup -j "$loop_file" | cut -d: -f1)
+        local attached_now=false
+        loop_device=$(losetup -j "$loop_file" 2>/dev/null | cut -d: -f1 | head -n 1)
+        if [[ -z "$loop_device" ]]; then
+            loop_device=$(losetup --find --show "$loop_file" 2>/dev/null || true)
+            [[ -n "$loop_device" ]] && attached_now=true
+        fi
+        if [[ -n "$loop_device" ]]; then
+            _green "Loop file $loop_file already exists, trying to reuse $loop_device."
+            mkdir -p "$mount_point"
+            if mountpoint -q "$mount_point" 2>/dev/null || mount "$loop_device" "$mount_point" 2>/dev/null; then
+                if ! grep -Fq "$loop_file" /etc/fstab 2>/dev/null; then
+                    echo "$loop_file $mount_point btrfs loop,defaults 0 0" >> /etc/fstab
+                fi
+                chmod 755 "$mount_point"
+                echo "$loop_device" > /usr/local/bin/podman_loop_device
+                echo "$loop_file"   > /usr/local/bin/podman_loop_file
+                echo "$mount_point" > /usr/local/bin/podman_mount_point
+                _green "Existing btrfs loop filesystem reused: $mount_point"
+                return 0
+            fi
+            if [[ "$attached_now" == "true" ]] || ! findmnt -S "$loop_device" >/dev/null 2>&1; then
+                losetup -d "$loop_device" 2>/dev/null || true
+            fi
+            _yellow "Existing loop file could not be mounted as btrfs; backing it up before recreation."
+        else
+            _yellow "Existing loop file could not be attached; backing it up before recreation."
+        fi
+        local backup_loop_file="${loop_file}.backup.$(date +%Y%m%d-%H%M%S)"
+        if ! mv "$loop_file" "$backup_loop_file" 2>/dev/null; then
+            _red "Failed to back up existing loop file: $loop_file"
+            return 1
+        fi
+        _yellow "Existing loop file backed up to: $backup_loop_file"
+    fi
+
+    if mountpoint -q "$mount_point" 2>/dev/null; then
+        _green "Mount point $mount_point is already mounted, skipping creation."
         mkdir -p "$mount_point"
-        mount "$loop_device" "$mount_point" 2>/dev/null || true
-        echo "$loop_device" > /usr/local/bin/podman_loop_device
-        echo "$loop_file"   > /usr/local/bin/podman_loop_file
         echo "$mount_point" > /usr/local/bin/podman_mount_point
         return 0
     fi
@@ -202,7 +250,7 @@ setup_podman_btrfs_loop() {
     mkfs.btrfs -f "$loop_device"
     mkdir -p "$mount_point"
     mount "$loop_device" "$mount_point"
-    if ! grep -q "$loop_file" /etc/fstab; then
+    if ! grep -Fq "$loop_file" /etc/fstab 2>/dev/null; then
         echo "$loop_file $mount_point btrfs loop,defaults 0 0" >> /etc/fstab
     fi
     chmod 755 "$mount_point"
@@ -285,12 +333,14 @@ check_ipv6() {
     if [[ -z "$IPV6" ]]; then
         _yellow "No public IPv6 on local interfaces, trying external APIs..."
         local API_NET=("ipv6.ip.sb" "https://ipget.net" "ipv6.ping0.cc" "https://api.my-ip.io/ip" "https://ipv6.icanhazip.com")
+        local py_bin
+        py_bin=$(python_cmd)
         for p in "${API_NET[@]}"; do
             local response
             response=$(curl -sLk6m8 "$p" 2>/dev/null | tr -d '[:space:]')
             if [[ $? -eq 0 ]] && [[ -n "$response" ]] && ! echo "$response" | grep -qi "error"; then
                 # 验证是否为合法 IPv6 地址
-                if python3 -c "import ipaddress; ipaddress.IPv6Address('${response}')" 2>/dev/null; then
+                if [[ -n "$py_bin" ]] && "$py_bin" -c "import ipaddress; ipaddress.IPv6Address('${response}')" 2>/dev/null; then
                     if ! is_private_ipv6 "$response"; then
                         IPV6="$response"
                         IPV6_ENABLED=true
@@ -318,21 +368,21 @@ install_base_deps() {
         Debian|Ubuntu)
             eval "${PACKAGE_UPDATE[int]}" 2>/dev/null || true
             ${PACKAGE_INSTALL[int]} curl wget ca-certificates nftables iproute2 \
-                socat unzip tar jq 2>/dev/null || true
+                socat unzip tar jq python3 2>/dev/null || true
             ;;
         CentOS|Fedora)
             ${PACKAGE_INSTALL[int]} curl wget ca-certificates nftables iproute \
-                socat unzip tar jq 2>/dev/null || true
+                socat unzip tar jq python3 2>/dev/null || true
             ;;
         Alpine)
             ${PACKAGE_UPDATE[int]} 2>/dev/null || true
             ${PACKAGE_INSTALL[int]} curl wget ca-certificates nftables iproute2 \
-                socat unzip tar jq 2>/dev/null || true
+                socat unzip tar jq python3 2>/dev/null || true
             ;;
         Arch)
             ${PACKAGE_UPDATE[int]} 2>/dev/null || true
             ${PACKAGE_INSTALL[int]} curl wget ca-certificates nftables iproute2 \
-                socat unzip tar jq 2>/dev/null || true
+                socat unzip tar jq python 2>/dev/null || true
             ;;
     esac
     _green "Base dependencies installed"
@@ -613,11 +663,15 @@ create_ipv6_network() {
         return 0
     fi
 
-    # 依次尝试 /96 → /80 → /64，选取 netavark 支持的最小前缀
+    # 依次尝试 /96 → /80 → /64，选取 netavark 支持的最小可用前缀。
     local prefix=""
+    local _plen
+    local py_bin
+    py_bin=$(python_cmd)
     for _plen in 96 80 64; do
-        if command -v python3 >/dev/null 2>&1; then
-            prefix=$(python3 -c "
+        prefix=""
+        if [[ -n "$py_bin" ]]; then
+            prefix=$("$py_bin" -c "
 import ipaddress, sys
 try:
     addr = ipaddress.ip_address('${ipv6_addr}')
@@ -633,51 +687,53 @@ except Exception:
             _seg4=$(echo "$ipv6_addr" | awk -F: '{print $1":"$2":"$3":"$4}')
             prefix="${_seg4}::/${_plen}"
         fi
-        [[ -n "$prefix" ]] && break
+
+        [[ -z "$prefix" ]] && continue
+
+        echo "$prefix" > /usr/local/bin/podman_ipv6_subnet
+        _yellow "Trying IPv6 subnet for podman-ipv6: ${prefix}"
+
+        # 尝试1：带 interface-name，--ipv6 先于 subnet（netavark 推荐顺序）
+        if podman network create \
+            --driver bridge \
+            --ipv6 \
+            --interface-name podman-br1 \
+            --subnet 172.21.0.0/16 \
+            --gateway 172.21.0.1 \
+            --subnet "${prefix}" \
+            podman-ipv6 2>/tmp/podman_net_err; then
+            _green "podman-ipv6 created (prefix /${_plen}, attempt 1): IPv4=172.21.0.0/16, IPv6=${prefix}"
+            return 0
+        fi
+        _yellow "Prefix /${_plen} attempt 1 failed: $(cat /tmp/podman_net_err 2>/dev/null)"
+
+        # 尝试2：不带 interface-name
+        if podman network create \
+            --driver bridge \
+            --ipv6 \
+            --subnet 172.21.0.0/16 \
+            --gateway 172.21.0.1 \
+            --subnet "${prefix}" \
+            podman-ipv6 2>/tmp/podman_net_err; then
+            _green "podman-ipv6 created (prefix /${_plen}, attempt 2): IPv4=172.21.0.0/16, IPv6=${prefix}"
+            return 0
+        fi
+        _yellow "Prefix /${_plen} attempt 2 failed: $(cat /tmp/podman_net_err 2>/dev/null)"
+
+        # 尝试3：仅 IPv6 子网（不含 IPv4 双栈）
+        if podman network create \
+            --driver bridge \
+            --ipv6 \
+            --subnet "${prefix}" \
+            podman-ipv6 2>/tmp/podman_net_err; then
+            _green "podman-ipv6 created (prefix /${_plen}, attempt 3, IPv6-only): IPv6=${prefix}"
+            return 0
+        fi
+        _yellow "Prefix /${_plen} attempt 3 failed: $(cat /tmp/podman_net_err 2>/dev/null)"
     done
 
-    echo "$prefix" > /usr/local/bin/podman_ipv6_subnet
-    _yellow "IPv6 subnet for podman-ipv6: ${prefix}"
-
-    # 尝试1：带 interface-name，--ipv6 先于 subnet（netavark 推荐顺序）
-    if podman network create \
-        --driver bridge \
-        --ipv6 \
-        --interface-name podman-br1 \
-        --subnet 172.21.0.0/16 \
-        --gateway 172.21.0.1 \
-        --subnet "${prefix}" \
-        podman-ipv6 2>/tmp/podman_net_err; then
-        _green "podman-ipv6 created (attempt 1): IPv4=172.21.0.0/16, IPv6=${prefix}"
-        return 0
-    fi
-    _yellow "Attempt 1 failed: $(cat /tmp/podman_net_err 2>/dev/null)"
-
-    # 尝试2：不带 interface-name
-    if podman network create \
-        --driver bridge \
-        --ipv6 \
-        --subnet 172.21.0.0/16 \
-        --gateway 172.21.0.1 \
-        --subnet "${prefix}" \
-        podman-ipv6 2>/tmp/podman_net_err; then
-        _green "podman-ipv6 created (attempt 2): IPv4=172.21.0.0/16, IPv6=${prefix}"
-        return 0
-    fi
-    _yellow "Attempt 2 failed: $(cat /tmp/podman_net_err 2>/dev/null)"
-
-    # 尝试3：仅 IPv6 子网（不含 IPv4 双栈）
-    if podman network create \
-        --driver bridge \
-        --ipv6 \
-        --subnet "${prefix}" \
-        podman-ipv6 2>/tmp/podman_net_err; then
-        _green "podman-ipv6 created (attempt 3, IPv6-only): IPv6=${prefix}"
-        return 0
-    fi
-    _yellow "Attempt 3 failed: $(cat /tmp/podman_net_err 2>/dev/null)"
-
     _yellow "Warning: podman-ipv6 creation failed, check manually"
+    echo "" > /usr/local/bin/podman_ipv6_subnet
     return 1
 }
 
@@ -820,13 +876,14 @@ main() {
         fi
     done
 
+    install_base_deps
     detect_interface
     check_ipv6
-    install_base_deps
     detect_firewall_backend
 
     # ======== 硬盘限制支持询问 ========
     # 支持以下环境变量实现一键安装（跳过所有交互提示）：
+    #   noninteractive=true            使用默认值跳过所有交互提示
     #   NEED_DISK_LIMIT=y/yes/true/1   是否启用 btrfs 容器磁盘大小限制
     #   PODMAN_INSTALL_PATH=<path>     Podman 存储路径（默认 /var/lib/containers/storage）
     #   PODMAN_POOL_SIZE=<整数>        存储池大小，单位 GB（仅 NEED_DISK_LIMIT 启用时有效）
@@ -834,14 +891,16 @@ main() {
 
     # --- 是否启用磁盘大小限制 ---
     if [[ -n "${NEED_DISK_LIMIT:-}" ]]; then
-        case "${NEED_DISK_LIMIT}" in
-            [Yy]|[Yy][Ee][Ss]|[Tt][Rr][Uu][Ee]|1)
-                _need_disk_limit_input="y"
-                _yellow "环境变量 NEED_DISK_LIMIT=${NEED_DISK_LIMIT}：启用容器磁盘大小限制" ;;
-            *)
-                _need_disk_limit_input="n"
-                _yellow "环境变量 NEED_DISK_LIMIT=${NEED_DISK_LIMIT}：不启用容器磁盘大小限制" ;;
-        esac
+        if is_truthy "${NEED_DISK_LIMIT}"; then
+            _need_disk_limit_input="y"
+            _yellow "环境变量 NEED_DISK_LIMIT=${NEED_DISK_LIMIT}：启用容器磁盘大小限制"
+        else
+            _need_disk_limit_input="n"
+            _yellow "环境变量 NEED_DISK_LIMIT=${NEED_DISK_LIMIT}：不启用容器磁盘大小限制"
+        fi
+    elif is_noninteractive; then
+        _need_disk_limit_input="n"
+        _yellow "noninteractive=true：使用默认标准 Podman 安装，不启用容器磁盘大小限制"
     else
         _green "是否需要支持容器硬盘大小限制的Podman环境？（支持btrfs存储驱动）"
         _green "Do you need Podman with container disk size limitation? (Support btrfs storage driver)"
@@ -854,6 +913,9 @@ main() {
     if [[ -n "${PODMAN_INSTALL_PATH:-}" ]]; then
         _podman_install_path="${PODMAN_INSTALL_PATH}"
         _yellow "环境变量 PODMAN_INSTALL_PATH：${_podman_install_path}"
+    elif is_noninteractive; then
+        _podman_install_path="/var/lib/containers/storage"
+        _yellow "noninteractive=true：使用默认 Podman 存储路径 ${_podman_install_path}"
     else
         _green "Where do you want to install Podman storage? (Enter to default: /var/lib/containers/storage):"
         reading "Podman存储路径？（回车则默认：/var/lib/containers/storage）：" _podman_install_path
@@ -863,13 +925,16 @@ main() {
     fi
     echo "$_podman_install_path" > /usr/local/bin/podman_install_path
 
-    if [[ "$_need_disk_limit_input" == "y" || "$_need_disk_limit_input" == "Y" ]]; then
+    if is_truthy "${_need_disk_limit_input:-}"; then
         echo "true" > /usr/local/bin/podman_need_disk_limit
 
         # --- 存储池大小 ---
         if [[ -n "${PODMAN_POOL_SIZE:-}" ]] && [[ "${PODMAN_POOL_SIZE}" =~ ^[1-9][0-9]*$ ]]; then
             _podman_pool_size="${PODMAN_POOL_SIZE}"
             _yellow "环境变量 PODMAN_POOL_SIZE：${_podman_pool_size}GB"
+        elif is_noninteractive; then
+            _podman_pool_size="20"
+            _yellow "noninteractive=true：PODMAN_POOL_SIZE 未提供或无效，使用默认 ${_podman_pool_size}GB"
         else
             while true; do
                 _green "How large a Podman storage pool is needed? (unit: GB, e.g., enter 20 for 20G):"
@@ -886,6 +951,9 @@ main() {
         if [[ -n "${PODMAN_LOOP_FILE:-}" ]]; then
             _podman_loop_file="${PODMAN_LOOP_FILE}"
             _yellow "环境变量 PODMAN_LOOP_FILE：${_podman_loop_file}"
+        elif is_noninteractive; then
+            _podman_loop_file="/opt/podman-pool.img"
+            _yellow "noninteractive=true：使用默认 Podman loop 文件 ${_podman_loop_file}"
         else
             _green "Where do you want to store the Podman loop file? (Enter to default: /opt/podman-pool.img):"
             reading "Podman循环文件存储位置？（回车则默认：/opt/podman-pool.img）：" _podman_loop_file
@@ -911,7 +979,10 @@ main() {
     _current_driver=$(cat /usr/local/bin/podman_storage_driver 2>/dev/null || echo "overlay")
     if [[ "$_podman_need_disk" == "true" ]] && [[ "$_current_driver" == "btrfs" ]] && \
        [[ -n "$_podman_pool_size" ]] && [[ -n "$_podman_loop_file" ]]; then
-        setup_podman_btrfs_loop "$_podman_pool_size" "$_podman_loop_file" "$_podman_install_path"
+        if ! setup_podman_btrfs_loop "$_podman_pool_size" "$_podman_loop_file" "$_podman_install_path"; then
+            _red "Podman btrfs loop filesystem setup failed"
+            exit 1
+        fi
     fi
 
     install_podman
@@ -923,9 +994,11 @@ main() {
 
     if [[ "$IPV6_ENABLED" == true ]]; then
         adapt_ipv6
-        create_ipv6_network "$IPV6"
-        start_ndpresponder
-        echo "true" > /usr/local/bin/podman_ipv6_enabled
+        if create_ipv6_network "$IPV6" && start_ndpresponder; then
+            echo "true" > /usr/local/bin/podman_ipv6_enabled
+        else
+            echo "false" > /usr/local/bin/podman_ipv6_enabled
+        fi
     else
         echo "false" > /usr/local/bin/podman_ipv6_enabled
     fi

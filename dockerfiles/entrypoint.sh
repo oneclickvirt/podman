@@ -15,6 +15,7 @@ if [ -d "$config_dir" ]; then
     for file in "${config_dir}"*; do
         [ -f "$file" ] || continue
         sed -i 's/PasswordAuthentication no/PasswordAuthentication yes/g' "$file" 2>/dev/null || true
+        sed -i 's/PermitRootLogin no/PermitRootLogin yes/g' "$file" 2>/dev/null || true
         sed -i 's/PermitRootLogin prohibit-password/PermitRootLogin yes/g' "$file" 2>/dev/null || true
     done
 fi
@@ -22,10 +23,16 @@ fi
 # 确保 sshd_config 允许 root 和密码登录
 sshd_cfg="/etc/ssh/sshd_config"
 if [ -f "$sshd_cfg" ]; then
-    grep -q "^PermitRootLogin yes" "$sshd_cfg" || \
+    if grep -qE '^#?PermitRootLogin[[:space:]]+' "$sshd_cfg"; then
         sed -i 's/^#\?PermitRootLogin.*/PermitRootLogin yes/' "$sshd_cfg"
-    grep -q "^PasswordAuthentication yes" "$sshd_cfg" || \
+    else
+        echo "PermitRootLogin yes" >> "$sshd_cfg"
+    fi
+    if grep -qE '^#?PasswordAuthentication[[:space:]]+' "$sshd_cfg"; then
         sed -i 's/^#\?PasswordAuthentication.*/PasswordAuthentication yes/' "$sshd_cfg"
+    else
+        echo "PasswordAuthentication yes" >> "$sshd_cfg"
+    fi
 fi
 
 # 修复 cloud-init 密码禁用策略
