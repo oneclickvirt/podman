@@ -7,15 +7,6 @@
 
 REGEX=("debian" "ubuntu" "centos|red hat|kernel|oracle linux|alma|rocky" "'amazon linux'" "fedora" "arch" "alpine")
 RELEASE=("Debian" "Ubuntu" "CentOS" "CentOS" "Fedora" "Arch" "Alpine")
-PACKAGE_UPDATE=(
-    "! apt-get update && apt-get --fix-broken install -y && apt-get update"
-    "apt-get update"
-    "yum -y update"
-    "yum -y update"
-    "yum -y update"
-    "pacman -Sy"
-    "apk update"
-)
 PACKAGE_INSTALL=(
     "apt-get -y install"
     "apt-get -y install"
@@ -163,7 +154,11 @@ setup_cron_sshd() {
 }
 
 # ======== 主流程 ========
-passwd_input="${1:-123456}"
+passwd_input="${1:-${ROOT_PASSWORD:-}}"
+if [[ -z "$passwd_input" || "$passwd_input" =~ [[:space:]] ]]; then
+    echo "Password is required and must not contain whitespace"
+    exit 1
+fi
 
 install_required_modules
 update_motd
@@ -171,8 +166,8 @@ disable_selinux_iptables
 fix_cloud_init
 update_sshd_config
 
-echo "root:${passwd_input}" | chpasswd 2>/dev/null || \
-    echo "root:${passwd_input}" | sudo chpasswd 2>/dev/null || true
+printf "%s\n" "root:${passwd_input}" | chpasswd 2>/dev/null || \
+    printf "%s\n" "root:${passwd_input}" | sudo chpasswd 2>/dev/null || true
 
 start_sshd
 setup_cron_sshd

@@ -16,6 +16,33 @@ is_truthy() {
         *) return 1 ;;
     esac
 }
+SUPPORTED_PODMAN_SYSTEMS="ubuntu/22.04, debian/12, alpine/latest, almalinux/9, rockylinux/9, openeuler/22.03"
+normalize_podman_system() {
+    local raw input compact
+    raw="${1:-}"
+    input=$(printf '%s' "$raw" | tr '[:upper:]' '[:lower:]' | tr -d '[:space:]')
+    case "$input" in
+        images:*|opsmaru:*|podman:*) input="${input#*:}" ;;
+        ghcr.io/oneclickvirt/podman:*) input="${input#ghcr.io/oneclickvirt/podman:}" ;;
+        localhost/spiritlhl/*) input="${input#localhost/spiritlhl/}" ;;
+    esac
+    compact="${input//\//}"
+    compact="${compact//-/}"
+    compact="${compact//_/}"
+    compact="${compact//./}"
+    compact="${compact//:/}"
+    compact="${compact%amd64}"
+    compact="${compact%arm64}"
+    case "$compact" in
+        ubuntu|ubuntu22|ubuntu2204) printf '%s\n' "ubuntu" ;;
+        debian|debian12) printf '%s\n' "debian" ;;
+        alpine|alpinelatest) printf '%s\n' "alpine" ;;
+        alma|alma9|almalinux|almalinux9) printf '%s\n' "almalinux" ;;
+        rocky|rocky9|rockylinux|rockylinux9) printf '%s\n' "rockylinux" ;;
+        openeuler|openeuler22|openeuler2203) printf '%s\n' "openeuler" ;;
+        *) return 1 ;;
+    esac
+}
 is_noninteractive() {
     is_truthy "${noninteractive:-${NONINTERACTIVE:-}}"
 }
@@ -60,6 +87,15 @@ cpu_or_default() {
         printf '%s' "$default_value"
     fi
 }
+generate_password() {
+    local generated
+    generated=$(LC_ALL=C tr -dc 'A-Za-z0-9' </dev/urandom 2>/dev/null | head -c 16 || true)
+    if [[ -z "$generated" ]]; then
+        generated=$(date +%s%N 2>/dev/null | md5sum 2>/dev/null | awk '{print substr($1,1,16)}' || true)
+    fi
+    [[ -n "$generated" ]] || generated="Podman$(date +%s)"
+    printf '%s' "$generated"
+}
 export DEBIAN_FRONTEND=noninteractive
 
 WITHOUT_CDN=false
@@ -67,29 +103,52 @@ if is_truthy "${WITHOUTCDN:-}"; then
     WITHOUT_CDN=true
 fi
 
+ROOTLESS_MODE=false
 if [ "$(id -u)" != "0" ]; then
-    _red "This script must be run as root" 1>&2
-    exit 1
+    if is_truthy "${PODMAN_ROOTLESS:-${PODMAN_ALLOW_ROOTLESS:-}}"; then
+        ROOTLESS_MODE=true
+        _yellow "PODMAN_ROOTLESS=true enabled, using rootless Podman mode"
+    else
+        _red "This script must be run as root, or set PODMAN_ROOTLESS=true for rootless Podman" 1>&2
+        exit 1
+    fi
 fi
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" 2>/dev/null && pwd)"
-cd /root || exit 1
+WORK_DIR="${PODMAN_WORKDIR:-}"
+if [[ -z "$WORK_DIR" ]]; then
+    if [[ "$ROOTLESS_MODE" == "true" ]]; then
+        WORK_DIR="${PWD}"
+    else
+        WORK_DIR="/root"
+    fi
+fi
+mkdir -p "$WORK_DIR" 2>/dev/null || true
+cd "$WORK_DIR" || exit 1
 
 # ======== CDN 检测 ========
 cdn_urls=("https://cdn0.spiritlhl.top/" "http://cdn1.spiritlhl.net/" "http://cdn2.spiritlhl.net/" "http://cdn3.spiritlhl.net/" "http://cdn4.spiritlhl.net/")
 cdn_success_url=""
 
+emit_cdn_urls() {
+    if command -v shuf >/dev/null 2>&1; then
+        shuf -e "${cdn_urls[@]}"
+    else
+        printf '%s\n' "${cdn_urls[@]}"
+    fi
+}
+
 check_cdn() {
     local o_url=$1
-    local shuffled_cdn_urls
-    shuffled_cdn_urls=($(shuf -e "${cdn_urls[@]}"))
-    for cdn_url in "${shuffled_cdn_urls[@]}"; do
+    local cdn_url
+    while IFS= read -r cdn_url; do
+        [[ -n "$cdn_url" ]] || continue
         if curl -4 -sL -k "${cdn_url}${o_url}" --max-time 6 | grep -q "success" >/dev/null 2>&1; then
             export cdn_success_url="$cdn_url"
             return
         fi
         sleep 0.5
-    done
+    done < <(emit_cdn_urls)
     export cdn_success_url=""
 }
 
@@ -112,6 +171,10 @@ check_cdn_file
 # ======== 检查依赖 ========
 pre_check() {
     if ! command -v podman >/dev/null 2>&1; then
+        if [[ "$ROOTLESS_MODE" == "true" ]]; then
+            _red "podman not found. Rootless mode requires Podman to be installed first."
+            exit 1
+        fi
         _yellow "podman not found, running podmaninstall.sh..."
         if [[ -f /root/podmaninstall.sh ]]; then
             bash /root/podmaninstall.sh
@@ -121,18 +184,40 @@ pre_check() {
     fi
 
     local local_onepodman
+    local scripts_home
+    local default_script_base
+    local configured_script_base
+    local script_base_url
     local_onepodman="${SCRIPT_DIR}/onepodman.sh"
-    if [[ ! -f /root/scripts/onepodman.sh ]]; then
-        mkdir -p /root/scripts
+    default_script_base="https://raw.githubusercontent.com/oneclickvirt/podman/main/scripts"
+    configured_script_base="${PODMAN_SCRIPT_BASE_URL:-$default_script_base}"
+    script_base_url="$configured_script_base"
+    if [[ "$configured_script_base" == "$default_script_base" ]]; then
+        script_base_url="${cdn_success_url}${configured_script_base}"
+    fi
+    if [[ "$ROOTLESS_MODE" == "true" ]]; then
+        scripts_home="${PODMAN_SCRIPT_DIR:-${HOME}/.local/share/oneclickvirt-podman/scripts}"
+    else
+        scripts_home="/root/scripts"
+    fi
+    if [[ ! -f "${scripts_home}/onepodman.sh" ]]; then
+        mkdir -p "$scripts_home" || {
+            _red "Failed to create scripts directory: ${scripts_home}"
+            exit 1
+        }
         if [[ -f "$local_onepodman" ]]; then
-            cp "$local_onepodman" /root/scripts/onepodman.sh
+            cp "$local_onepodman" "${scripts_home}/onepodman.sh"
         else
             curl -sL --connect-timeout 10 --max-time 60 \
-                "${cdn_success_url}https://raw.githubusercontent.com/oneclickvirt/podman/main/scripts/onepodman.sh" \
-                -o /root/scripts/onepodman.sh
+                "${script_base_url}/onepodman.sh" \
+                -o "${scripts_home}/onepodman.sh"
         fi
-        chmod +x /root/scripts/onepodman.sh
     fi
+    if [[ ! -s "${scripts_home}/onepodman.sh" ]]; then
+        _red "onepodman.sh is missing or empty: ${scripts_home}/onepodman.sh"
+        exit 1
+    fi
+    chmod +x "${scripts_home}/onepodman.sh"
 }
 
 # ======== 读取日志，恢复编号状态 ========
@@ -141,8 +226,8 @@ container_prefix="ct"
 container_num=0
 ssh_port=25000
 public_port_end=34975
-declare -A existing_container_names=()
-declare -A used_host_ports=()
+existing_container_names=" "
+used_host_ports=" "
 
 mark_used_port_range() {
     local start="$1"
@@ -151,8 +236,20 @@ mark_used_port_range() {
     [[ "$start" =~ ^[0-9]+$ && "$end" =~ ^[0-9]+$ ]] || return 0
     (( start >= 1 && end <= 65535 && start <= end )) || return 0
     for ((p = start; p <= end; p++)); do
-        used_host_ports["$p"]=1
+        used_host_ports+="${p} "
     done
+}
+
+port_is_used() {
+    [[ "$used_host_ports" == *" $1 "* ]]
+}
+
+mark_container_name() {
+    [[ -n "${1:-}" ]] && existing_container_names+="${1} "
+}
+
+container_name_exists() {
+    [[ "$existing_container_names" == *" $1 "* ]]
 }
 
 mark_port_token() {
@@ -169,12 +266,12 @@ mark_port_token() {
 
 collect_existing_state() {
     local name sshp _pw _cpu _mem sp ep _dk port_line mapping listen_port
-    existing_container_names=()
-    used_host_ports=()
+    existing_container_names=" "
+    used_host_ports=" "
 
     if command -v podman >/dev/null 2>&1; then
         while IFS= read -r name; do
-            [[ -n "$name" ]] && existing_container_names["$name"]=1
+            mark_container_name "$name"
         done < <(podman ps -a --format '{{.Names}}' 2>/dev/null || true)
 
         while IFS= read -r port_line; do
@@ -186,7 +283,7 @@ collect_existing_state() {
 
     if [[ -f "$log_file" ]]; then
         while read -r name sshp _pw _cpu _mem sp ep _dk _rest || [[ -n "$name" ]]; do
-            [[ -n "$name" ]] && existing_container_names["$name"]=1
+            mark_container_name "$name"
             mark_port_token "$sshp"
             mark_used_port_range "$sp" "$ep"
         done < "$log_file"
@@ -204,9 +301,9 @@ next_container_name() {
     while true; do
         container_num=$((container_num + 1))
         candidate="${container_prefix}${container_num}"
-        if [[ -z "${existing_container_names[$candidate]:-}" ]]; then
+        if ! container_name_exists "$candidate"; then
             container_name="$candidate"
-            existing_container_names["$container_name"]=1
+            mark_container_name "$container_name"
             return 0
         fi
         _yellow "Container name ${candidate} already exists, skipping"
@@ -222,7 +319,7 @@ next_ssh_port() {
             exit 1
         fi
         ssh_port="$candidate"
-        if [[ -z "${used_host_ports[$ssh_port]:-}" ]]; then
+        if ! port_is_used "$ssh_port"; then
             mark_used_port_range "$ssh_port" "$ssh_port"
             return 0
         fi
@@ -241,7 +338,7 @@ next_public_port_range() {
         fi
         conflict_port=""
         for ((p = start; p <= end; p++)); do
-            if [[ -n "${used_host_ports[$p]:-}" ]]; then
+            if port_is_used "$p"; then
                 conflict_port="$p"
                 break
             fi
@@ -307,6 +404,10 @@ apply_resume_overrides() {
 # ======== 交互式创建 ========
 build_new_containers() {
     local env_value
+    local container_pod_name
+    local normalized_system
+    local requested_system
+    local system_from_env
     env_value=$(get_env_first PODMAN_CREATE_NUMS PODMAN_CREATE_COUNT CREATE_NUMS CREATE_COUNT 2>/dev/null || true)
     if [[ -n "$env_value" ]]; then
         new_nums="$env_value"
@@ -318,6 +419,13 @@ build_new_containers() {
         reading "需要新增几个容器？(How many containers to create?) [default: 1]: " new_nums
     fi
     new_nums=$(positive_int_or_default "$new_nums" 1)
+    if [[ -n "${PODMAN_POD_NAME:-}" && "$new_nums" -gt 1 ]]; then
+        if is_truthy "${PODMAN_POD_JOIN_EXISTING:-}"; then
+            _yellow "Multiple containers will join pod ${PODMAN_POD_NAME}; ensure services do not conflict inside the shared namespace"
+        else
+            _yellow "PODMAN_POD_NAME is set for batch mode; using per-container pod names based on ${PODMAN_POD_NAME}"
+        fi
+    fi
 
     env_value=$(get_env_first PODMAN_MEMORY_MB MEMORY_MB 2>/dev/null || true)
     if [[ -n "$env_value" ]]; then
@@ -367,23 +475,36 @@ build_new_containers() {
         disk_size=0
     fi
 
-    env_value=$(get_env_first PODMAN_SYSTEM SYSTEM_TYPE 2>/dev/null || true)
-    if [[ -n "$env_value" ]]; then
-        system_type="$env_value"
-        _yellow "Using system from environment: ${system_type}"
-    elif is_noninteractive; then
-        system_type="debian"
-        _yellow "noninteractive=true: using default system ${system_type}"
-    else
-        _blue "可选系统: ubuntu / debian / alpine / almalinux / rockylinux / openeuler"
-        reading "选择系统 (Choose system) [default: debian]: " system_type
-        [[ -z "$system_type" ]] && system_type="debian"
-    fi
-    system_type=$(echo "$system_type" | tr '[:upper:]' '[:lower:]')
-    if [[ ! "$system_type" =~ ^(ubuntu|debian|alpine|almalinux|rockylinux|openeuler)$ ]]; then
-        _yellow "Unknown system '${system_type}', using debian"
-        system_type="debian"
-    fi
+    while true; do
+        system_from_env=false
+        env_value=$(get_env_first PODMAN_SYSTEM SYSTEM_TYPE 2>/dev/null || true)
+        if [[ -n "$env_value" ]]; then
+            system_type="$env_value"
+            system_from_env=true
+            _yellow "Using system from environment: ${system_type}"
+        elif is_noninteractive; then
+            system_type="debian"
+            _yellow "noninteractive=true: using default system ${system_type}"
+        else
+            _blue "可选系统: ubuntu/22.04 / debian/12 / alpine/latest / almalinux/9 / rockylinux/9 / openeuler/22.03"
+            reading "选择系统 (Choose system) [default: debian]: " system_type
+            [[ -z "$system_type" ]] && system_type="debian"
+        fi
+
+        requested_system="$system_type"
+        if normalized_system=$(normalize_podman_system "$requested_system"); then
+            system_type="$normalized_system"
+            if [[ "$requested_system" != "$system_type" ]]; then
+                _yellow "Using normalized system '${system_type}' from input '${requested_system}'"
+            fi
+            break
+        fi
+
+        _yellow "Unsupported system '${requested_system}'. Supported systems: ${SUPPORTED_PODMAN_SYSTEMS}"
+        if [[ "$system_from_env" == "true" ]] || is_noninteractive; then
+            exit 1
+        fi
+    done
 
     IPV6_AVAILABLE=false
     if [[ -f /usr/local/bin/podman_ipv6_enabled ]]; then
@@ -415,10 +536,16 @@ build_new_containers() {
     local scripts_dir
     if [[ -f "${SCRIPT_DIR}/onepodman.sh" ]]; then
         scripts_dir="$SCRIPT_DIR"
-    elif [[ -f /root/scripts/onepodman.sh ]]; then
+    elif [[ "$ROOTLESS_MODE" != "true" && -f /root/scripts/onepodman.sh ]]; then
         scripts_dir="/root/scripts"
+    elif [[ "$ROOTLESS_MODE" == "true" ]]; then
+        scripts_dir="${PODMAN_SCRIPT_DIR:-${HOME}/.local/share/oneclickvirt-podman/scripts}"
     else
-        scripts_dir="/root"
+        scripts_dir="/root/scripts"
+    fi
+    if [[ ! -s "${scripts_dir}/onepodman.sh" ]]; then
+        _red "onepodman.sh is missing or empty: ${scripts_dir}/onepodman.sh"
+        exit 1
     fi
 
     collect_existing_state
@@ -428,12 +555,15 @@ build_new_containers() {
         next_ssh_port
         next_public_port_range
 
-        ori=$(date +%s%N | md5sum 2>/dev/null || date | md5sum)
-        passwd="${ori:2:9}"
+        passwd="$(generate_password)"
+        container_pod_name="${PODMAN_POD_NAME:-}"
+        if [[ -n "$container_pod_name" && "$new_nums" -gt 1 ]] && ! is_truthy "${PODMAN_POD_JOIN_EXISTING:-}"; then
+            container_pod_name="${container_pod_name}-${container_name}"
+        fi
 
         _yellow "[${i}/${new_nums}] Creating container: ${container_name}  ssh:${ssh_port}  ports:${public_port_start}-${public_port_end}"
 
-        if ! PODMAN_SKIP_RESOURCE_CHECK=true bash "${scripts_dir}/onepodman.sh" \
+        if ! PODMAN_SKIP_RESOURCE_CHECK=true PODMAN_BATCH_MODE=true PODMAN_POD_NAME="$container_pod_name" bash "${scripts_dir}/onepodman.sh" \
             "$container_name" \
             "$cpu_nums" \
             "$memory_nums" \

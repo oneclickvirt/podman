@@ -23,10 +23,21 @@ permissions:
   contents: write
   packages: write
 
+env:
+  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event_name }}-${{ github.ref }}
+  cancel-in-progress: false
+
 jobs:
   build:
     name: Build ${{ matrix.os }} (${{ matrix.arch }})
     runs-on: ${{ matrix.runner }}
+    timeout-minutes: 360
+    concurrency:
+      group: build-${{ matrix.os }}-${{ matrix.arch }}-${{ github.ref }}
+      cancel-in-progress: false
     strategy:
       fail-fast: false
       matrix:
@@ -82,12 +93,12 @@ jobs:
 
     steps:
       - name: Checkout repository
-        uses: actions/checkout@v4
+        uses: actions/checkout@v6
 
       - name: Check if this OS should be built
         id: check
         run: |
-          INPUT_OS="${{ github.event.inputs.os }}"
+          INPUT_OS="${{ github.event.inputs.os || '' }}"
           if [[ -z "$INPUT_OS" || "$INPUT_OS" == "${{ matrix.os }}" ]]; then
             echo "should_build=true" >> "$GITHUB_OUTPUT"
           else
@@ -96,7 +107,7 @@ jobs:
 
       - name: Set up QEMU (for cross-arch builds)
         if: steps.check.outputs.should_build == 'true'
-        uses: docker/setup-qemu-action@v3
+        uses: docker/setup-qemu-action@v4
         with:
           platforms: arm64,amd64
 
@@ -158,7 +169,7 @@ jobs:
 
       - name: Upload tar.gz as GitHub Release asset
         if: steps.check.outputs.should_build == 'true'
-        uses: softprops/action-gh-release@v2
+        uses: softprops/action-gh-release@v3
         with:
           tag_name: ${{ matrix.os }}
           name: "${{ matrix.os }} images"
@@ -193,6 +204,10 @@ jobs:
     name: Create multi-arch manifest for ${{ matrix.os }}
     needs: build
     runs-on: ubuntu-latest
+    timeout-minutes: 60
+    concurrency:
+      group: manifest-${{ matrix.os }}-${{ github.ref }}
+      cancel-in-progress: false
     strategy:
       fail-fast: false
       matrix:
@@ -201,7 +216,7 @@ jobs:
       - name: Check if this OS should be processed
         id: check
         run: |
-          INPUT_OS="${{ github.event.inputs.os }}"
+          INPUT_OS="${{ github.event.inputs.os || '' }}"
           if [[ -z "$INPUT_OS" || "$INPUT_OS" == "${{ matrix.os }}" ]]; then
             echo "should_build=true" >> "$GITHUB_OUTPUT"
           else

@@ -1,3 +1,30 @@
+2026.06.04
+- 调整容器镜像获取顺序为 GHCR/自定义镜像仓库优先，失败后回退 GitHub Releases 离线包
+- 修复 `PODMAN_INSTALL_PATH` 未写入 root Podman `storage.conf` 的问题，并使用 `graphroot` 键对齐 containers/storage 配置
+- 在 systemd 环境缺失 `podman-restart.service` 时创建兜底服务，确保 `--restart always` 容器在 daemonless 模式下可随系统启动
+- 修复兜底 `podman-restart.service` 的 `$id` 引用，卸载时仅停用并清理本项目生成的 unit，避免影响发行版自带 unit
+- 批量创建时校验 `onepodman.sh` 下载/复制结果，避免 rootless 失败路径误落到 `/root`
+- 单容器和批量创建统一规范化系统参数，支持 `debian12`、`debian/12`、`ubuntu22.04` 等版本写法，避免已支持镜像被误判为无效
+- CDN 探测在缺少 `shuf` 时回退到固定顺序，DNS 保活在缺少 `nslookup` 时回退到 `getent`/`ping`
+- 单容器创建增加 SSH 端口与公网端口范围重叠校验，并修正 pod join 场景的宿主端口冲突检查
+- 单容器和批量创建脚本移除 Bash 4 专用关联数组与小写展开，提升旧 Bash 环境下的可验证性
+
+2026.06.03
+- 新增 `.gitignore`，排除环境变量、数据库、密钥、密码文件、截图、容器记录和构建产物
+- 移除单容器创建的固定默认弱密码，未传或传空字符串时自动生成随机密码
+- 移除容器内 SSH 初始化脚本的固定弱密码兜底，缺少密码时直接失败
+- 密码写入统一使用 `printf | chpasswd`，避免 `echo` 对特殊字符处理不一致
+- 批量创建密码升级为随机生成，保持 ctlog 可解析
+- GitHub Actions 增加 `FORCE_JAVASCRIPT_ACTIONS_TO_NODE24`、workflow/job concurrency 和 timeout-minutes
+- GitHub Actions 升级 `actions/checkout@v6`、`docker/setup-qemu-action@v4` 与 `softprops/action-gh-release@v3`
+- 移除安装脚本中的 `eval` 包管理更新路径，改为显式函数
+- 单容器创建默认写入 `ctlog`，批量创建使用临时记录文件后立即归档，减少密码记录散落
+- 镜像 tar 下载与 IPv6 网络创建错误日志改为进程隔离临时文件，避免并发复用污染
+- 新增 `PODMAN_RELEASE_BASE_URL`、`PODMAN_GHCR_IMAGE`、`PODMAN_SCRIPT_BASE_URL` 自定义源配置
+- 新增受控 `PODMAN_ROOTLESS` 创建模式与安装阶段 `PODMAN_ROOTLESS_USER` rootless 预配置
+- 新增 `PODMAN_POD_NAME` / `PODMAN_POD_JOIN_EXISTING` 可选 Podman pod 网络支持
+- README 增加 5 步快速开始、Mermaid 架构图和补充环境变量说明
+
 2026.06.02
 - 统一使用 `noninteractive=true` 作为安装、批量创建、卸载的无交互开关
 - 批量创建支持环境变量传参，并一次性收集容器名与端口占用，避免重复查询

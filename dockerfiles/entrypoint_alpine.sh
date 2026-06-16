@@ -6,7 +6,7 @@ set -e
 
 # 设置 root 密码
 if [ -n "$ROOT_PASSWORD" ]; then
-    echo "root:${ROOT_PASSWORD}" | chpasswd 2>/dev/null || true
+    printf "%s\n" "root:${ROOT_PASSWORD}" | chpasswd 2>/dev/null || true
 fi
 
 # 修复 sshd_config.d/

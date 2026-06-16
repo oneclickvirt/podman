@@ -27,6 +27,10 @@ remove_fstab_entry() {
     cp "$tmp_file" /etc/fstab 2>/dev/null || true
     rm -f "$tmp_file" 2>/dev/null || true
 }
+is_project_podman_restart_unit() {
+    local unit_file="/etc/systemd/system/podman-restart.service"
+    [[ -f "$unit_file" ]] && grep -q "OneClickVirt Podman Restart Policy Containers" "$unit_file" 2>/dev/null
+}
 
 if [ "$(id -u)" != "0" ]; then
     _red "This script must be run as root"
@@ -63,12 +67,15 @@ fi
 # ======== 1. 停止并删除所有容器 ========
 _blue "[1/7] 停止并删除所有容器..."
 if command -v podman >/dev/null 2>&1; then
-    containers=$(podman ps -aq 2>/dev/null || true)
-    if [[ -n "$containers" ]]; then
+    containers=()
+    while IFS= read -r container_id; do
+        [[ -n "$container_id" ]] && containers+=("$container_id")
+    done < <(podman ps -aq 2>/dev/null || true)
+    if [[ ${#containers[@]} -gt 0 ]]; then
         _yellow "  停止所有容器..."
-        podman stop $containers 2>/dev/null || true
+        podman stop "${containers[@]}" 2>/dev/null || true
         _yellow "  删除所有容器..."
-        podman rm -f $containers 2>/dev/null || true
+        podman rm -f "${containers[@]}" 2>/dev/null || true
     fi
     _green "  容器清理完成"
 fi
@@ -76,9 +83,12 @@ fi
 # ======== 2. 删除所有镜像 ========
 _blue "[2/7] 删除所有镜像..."
 if command -v podman >/dev/null 2>&1; then
-    images=$(podman images -aq 2>/dev/null || true)
-    if [[ -n "$images" ]]; then
-        podman rmi -f $images 2>/dev/null || true
+    images=()
+    while IFS= read -r image_id; do
+        [[ -n "$image_id" ]] && images+=("$image_id")
+    done < <(podman images -aq 2>/dev/null || true)
+    if [[ ${#images[@]} -gt 0 ]]; then
+        podman rmi -f "${images[@]}" 2>/dev/null || true
     fi
     # 清理 volume 和未使用资源
     podman volume prune -f 2>/dev/null || true
@@ -94,19 +104,35 @@ fi
 
 # ======== 4. 停止 systemd 服务 ========
 _blue "[4/7] 停止并禁用辅助服务..."
-for svc in check-dns-podman podman-restart podman.socket podman; do
-    if systemctl is-active --quiet "$svc" 2>/dev/null; then
-        systemctl stop "$svc" 2>/dev/null || true
-        _yellow "  已停止 ${svc}"
+if command -v systemctl >/dev/null 2>&1; then
+    for svc in check-dns-podman podman.socket podman; do
+        if systemctl is-active --quiet "$svc" 2>/dev/null; then
+            systemctl stop "$svc" 2>/dev/null || true
+            _yellow "  已停止 ${svc}"
+        fi
+        if systemctl is-enabled --quiet "$svc" 2>/dev/null; then
+            systemctl disable "$svc" 2>/dev/null || true
+        fi
+    done
+    if is_project_podman_restart_unit; then
+        if systemctl is-active --quiet podman-restart 2>/dev/null; then
+            systemctl stop podman-restart 2>/dev/null || true
+            _yellow "  已停止 podman-restart"
+        fi
+        if systemctl is-enabled --quiet podman-restart 2>/dev/null; then
+            systemctl disable podman-restart 2>/dev/null || true
+        fi
     fi
-    if systemctl is-enabled --quiet "$svc" 2>/dev/null; then
-        systemctl disable "$svc" 2>/dev/null || true
-    fi
-done
-for f in /etc/systemd/system/check-dns-podman.service; do
-    [[ -f "$f" ]] && rm -f "$f" && _yellow "  删除 $f"
-done
-systemctl daemon-reload 2>/dev/null || true
+fi
+f=/etc/systemd/system/check-dns-podman.service
+[[ -f "$f" ]] && rm -f "$f" && _yellow "  删除 $f"
+f=/etc/systemd/system/podman-restart.service
+if is_project_podman_restart_unit; then
+    rm -f "$f" && _yellow "  删除 $f"
+fi
+if command -v systemctl >/dev/null 2>&1; then
+    systemctl daemon-reload 2>/dev/null || true
+fi
 
 # ======== 5. 删除 Podman 网络 ========
 _blue "[5/7] 删除 Podman 网络..."

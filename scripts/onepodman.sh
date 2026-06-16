@@ -5,6 +5,7 @@
 
 # Usage:
 # ./onepodman.sh <name> <cpu> <memory_mb> <password> <sshport> <startport> <endport> [independent_ipv6:y/n] [system] [disk_gb]
+# Pass an empty password argument "" to auto-generate one while keeping later positional arguments.
 
 _red()    { echo -e "\033[31m\033[01m$*\033[0m"; }
 _green()  { echo -e "\033[32m\033[01m$*\033[0m"; }
@@ -16,6 +17,42 @@ is_truthy() {
         *) return 1 ;;
     esac
 }
+SUPPORTED_PODMAN_SYSTEMS="ubuntu/22.04, debian/12, alpine/latest, almalinux/9, rockylinux/9, openeuler/22.03"
+normalize_podman_system() {
+    local raw input compact
+    raw="${1:-}"
+    input=$(printf '%s' "$raw" | tr '[:upper:]' '[:lower:]' | tr -d '[:space:]')
+    case "$input" in
+        images:*|opsmaru:*|podman:*) input="${input#*:}" ;;
+        ghcr.io/oneclickvirt/podman:*) input="${input#ghcr.io/oneclickvirt/podman:}" ;;
+        localhost/spiritlhl/*) input="${input#localhost/spiritlhl/}" ;;
+    esac
+    compact="${input//\//}"
+    compact="${compact//-/}"
+    compact="${compact//_/}"
+    compact="${compact//./}"
+    compact="${compact//:/}"
+    compact="${compact%amd64}"
+    compact="${compact%arm64}"
+    case "$compact" in
+        ubuntu|ubuntu22|ubuntu2204) printf '%s\n' "ubuntu" ;;
+        debian|debian12) printf '%s\n' "debian" ;;
+        alpine|alpinelatest) printf '%s\n' "alpine" ;;
+        alma|alma9|almalinux|almalinux9) printf '%s\n' "almalinux" ;;
+        rocky|rocky9|rockylinux|rockylinux9) printf '%s\n' "rockylinux" ;;
+        openeuler|openeuler22|openeuler2203) printf '%s\n' "openeuler" ;;
+        *) return 1 ;;
+    esac
+}
+generate_password() {
+    local generated
+    generated=$(LC_ALL=C tr -dc 'A-Za-z0-9' </dev/urandom 2>/dev/null | head -c 16 || true)
+    if [[ -z "$generated" ]]; then
+        generated=$(date +%s%N 2>/dev/null | md5sum 2>/dev/null | awk '{print substr($1,1,16)}' || true)
+    fi
+    [[ -n "$generated" ]] || generated="Podman$(date +%s)"
+    printf '%s' "$generated"
+}
 export DEBIAN_FRONTEND=noninteractive
 
 WITHOUT_CDN=false
@@ -23,16 +60,25 @@ if is_truthy "${WITHOUTCDN:-}"; then
     WITHOUT_CDN=true
 fi
 
+ROOTLESS_MODE=false
 if [ "$(id -u)" != "0" ]; then
-    _red "This script must be run as root" 1>&2
-    exit 1
+    if is_truthy "${PODMAN_ROOTLESS:-${PODMAN_ALLOW_ROOTLESS:-}}"; then
+        ROOTLESS_MODE=true
+        _yellow "PODMAN_ROOTLESS=true enabled, using rootless Podman mode"
+    else
+        _red "This script must be run as root, or set PODMAN_ROOTLESS=true for rootless Podman" 1>&2
+        exit 1
+    fi
 fi
 
 # ======== 参数 ========
 name="${1:-test}"
 cpu="${2:-1}"
 memory="${3:-512}"
-passwd="${4:-123456}"
+passwd="${4:-}"
+if [[ -z "$passwd" ]]; then
+    passwd="$(generate_password)"
+fi
 sshport="${5:-25000}"
 startport="${6:-34975}"
 endport="${7:-35000}"
@@ -40,7 +86,7 @@ independent_ipv6="${8:-N}"
 system="${9:-debian}"
 disk="${10:-0}"
 
-declare -A used_host_ports=()
+used_host_ports=" "
 
 validate_port() {
     local value="${1:-}"
@@ -54,8 +100,12 @@ mark_used_port_range() {
     [[ "$start" =~ ^[0-9]+$ && "$end" =~ ^[0-9]+$ ]] || return 0
     (( start >= 1 && end <= 65535 && start <= end )) || return 0
     for ((p = start; p <= end; p++)); do
-        used_host_ports["$p"]=1
+        used_host_ports+="${p} "
     done
+}
+
+port_is_used() {
+    [[ "$used_host_ports" == *" $1 "* ]]
 }
 
 mark_port_token() {
@@ -69,7 +119,7 @@ mark_port_token() {
 
 collect_used_host_ports() {
     local listen_port port_line mapping
-    used_host_ports=()
+    used_host_ports=" "
     if command -v ss >/dev/null 2>&1; then
         while IFS= read -r listen_port; do
             mark_port_token "$listen_port"
@@ -85,7 +135,17 @@ collect_used_host_ports() {
 }
 
 validate_inputs() {
-    system=$(echo "$system" | tr '[:upper:]' '[:lower:]')
+    local requested_system normalized_system
+    requested_system="$system"
+    if ! normalized_system=$(normalize_podman_system "$requested_system"); then
+        _red "Unsupported system: ${requested_system}"
+        _red "Supported systems: ${SUPPORTED_PODMAN_SYSTEMS}"
+        exit 1
+    fi
+    system="$normalized_system"
+    if [[ "$requested_system" != "$system" ]]; then
+        _yellow "Using normalized system '${system}' from input '${requested_system}'"
+    fi
     if [[ ! "$name" =~ ^[a-zA-Z0-9][a-zA-Z0-9_.-]*$ ]]; then
         _red "Invalid container name: ${name}"
         exit 1
@@ -110,12 +170,15 @@ validate_inputs() {
         _red "Invalid port range: startport must be <= endport"
         exit 1
     fi
-    if [[ ! "$disk" =~ ^[0-9]+$ ]]; then
-        _red "Invalid disk value: ${disk}"
+    if (( sshport >= startport && sshport <= endport )); then
+        _red "Invalid port configuration: SSH host port ${sshport} overlaps public port range ${startport}-${endport}"
         exit 1
     fi
-    if [[ ! "$system" =~ ^(ubuntu|debian|alpine|almalinux|rockylinux|openeuler)$ ]]; then
-        _red "Unsupported system: ${system}"
+    if [[ "$ROOTLESS_MODE" == "true" ]] && (( sshport < 1024 || startport < 1024 || endport < 1024 )); then
+        _yellow "Rootless Podman usually cannot bind host ports below 1024 without extra host sysctl configuration"
+    fi
+    if [[ ! "$disk" =~ ^[0-9]+$ ]]; then
+        _red "Invalid disk value: ${disk}"
         exit 1
     fi
     if is_truthy "$independent_ipv6"; then
@@ -167,6 +230,14 @@ fi
 # ======== 存储驱动检测 ========
 check_storage_driver() {
     podman_storage_driver="overlay"
+    if [[ "$ROOTLESS_MODE" == "true" ]]; then
+        btrfs_support="N"
+        if [[ "$disk" != "0" ]]; then
+            _yellow "Rootless mode does not support this script's btrfs disk limit path, ignoring disk parameter"
+            disk="0"
+        fi
+        return 0
+    fi
     if [[ -f /usr/local/bin/podman_storage_driver ]]; then
         podman_storage_driver=$(cat /usr/local/bin/podman_storage_driver)
     fi
@@ -198,34 +269,48 @@ if ! is_truthy "${PODMAN_SKIP_RESOURCE_CHECK:-}"; then
         exit 1
     fi
 
-    collect_used_host_ports
-    if [[ -n "${used_host_ports[$sshport]:-}" ]]; then
-        _red "SSH host port ${sshport} is already in use"
-        exit 1
+    should_check_host_ports=true
+    if [[ -n "${PODMAN_POD_NAME:-}" ]] && is_truthy "${PODMAN_POD_JOIN_EXISTING:-}" && podman pod exists "$PODMAN_POD_NAME" 2>/dev/null; then
+        should_check_host_ports=false
     fi
-    for ((port = startport; port <= endport; port++)); do
-        if [[ -n "${used_host_ports[$port]:-}" ]]; then
-            _red "Public host port ${port} is already in use"
+    if [[ "$should_check_host_ports" == "true" ]]; then
+        collect_used_host_ports
+        if port_is_used "$sshport"; then
+            _red "SSH host port ${sshport} is already in use"
             exit 1
         fi
-    done
+        for ((port = startport; port <= endport; port++)); do
+            if port_is_used "$port"; then
+                _red "Public host port ${port} is already in use"
+                exit 1
+            fi
+        done
+    fi
 fi
 
 # ======== CDN ========
 cdn_urls=("https://cdn0.spiritlhl.top/" "http://cdn1.spiritlhl.net/" "http://cdn2.spiritlhl.net/" "http://cdn3.spiritlhl.net/" "http://cdn4.spiritlhl.net/")
 cdn_success_url=""
 
+emit_cdn_urls() {
+    if command -v shuf >/dev/null 2>&1; then
+        shuf -e "${cdn_urls[@]}"
+    else
+        printf '%s\n' "${cdn_urls[@]}"
+    fi
+}
+
 check_cdn() {
     local o_url=$1
-    local shuffled_cdn_urls
-    shuffled_cdn_urls=($(shuf -e "${cdn_urls[@]}"))
-    for cdn_url in "${shuffled_cdn_urls[@]}"; do
+    local cdn_url
+    while IFS= read -r cdn_url; do
+        [[ -n "$cdn_url" ]] || continue
         if curl -4 -sL -k "${cdn_url}${o_url}" --max-time 6 | grep -q "success" >/dev/null 2>&1; then
             export cdn_success_url="$cdn_url"
             return
         fi
         sleep 0.5
-    done
+    done < <(emit_cdn_urls)
     export cdn_success_url=""
 }
 
@@ -247,10 +332,13 @@ check_cdn_file
 
 # ======== IPv6 条件检测（三重：网络存在 + ndpresponder 运行 + 地址文件有值）========
 IPV6_ENABLED=false
-ipv6_address=""
-ipv6_address_without_last_segment=""
-if [[ -f /usr/local/bin/podman_ipv6_enabled ]] && \
-   [[ "$(cat /usr/local/bin/podman_ipv6_enabled)" == "true" ]]; then
+if [[ "$ROOTLESS_MODE" == "true" ]]; then
+    if [[ "$independent_ipv6" == "y" ]]; then
+        _yellow "Independent IPv6 network mode is not enabled for rootless Podman, falling back to rootless default network"
+        independent_ipv6="n"
+    fi
+elif [[ -f /usr/local/bin/podman_ipv6_enabled ]] && \
+     [[ "$(cat /usr/local/bin/podman_ipv6_enabled)" == "true" ]]; then
     # 条件1：podman-ipv6 网络存在
     if podman network exists podman-ipv6 2>/dev/null; then
         # 条件2：ndpresponder 容器正在运行
@@ -259,8 +347,6 @@ if [[ -f /usr/local/bin/podman_ipv6_enabled ]] && \
             # 条件3：IPv6 地址文件有值
             if [[ -f /usr/local/bin/podman_check_ipv6 ]] && \
                [[ -s /usr/local/bin/podman_check_ipv6 ]]; then
-                ipv6_address=$(cat /usr/local/bin/podman_check_ipv6)
-                ipv6_address_without_last_segment="${ipv6_address%:*}:"
                 IPV6_ENABLED=true
             fi
         fi
@@ -275,16 +361,18 @@ fi
 
 # ======== lxcfs 检测 ========
 lxcfs_volumes=""
-for dir in /var/lib/lxcfs/proc /var/lib/lxcfs; do
-    if [[ -d "${dir}/proc" ]]; then
-        lxcfs_volumes="-v ${dir}/proc/cpuinfo:/proc/cpuinfo:rw \
-            -v ${dir}/proc/diskstats:/proc/diskstats:rw \
-            -v ${dir}/proc/meminfo:/proc/meminfo:rw \
-            -v ${dir}/proc/stat:/proc/stat:rw \
-            -v ${dir}/proc/uptime:/proc/uptime:rw"
-        break
-    fi
-done
+if [[ "$ROOTLESS_MODE" != "true" ]]; then
+    for dir in /var/lib/lxcfs/proc /var/lib/lxcfs; do
+        if [[ -d "${dir}/proc" ]]; then
+            lxcfs_volumes="-v ${dir}/proc/cpuinfo:/proc/cpuinfo:rw \
+                -v ${dir}/proc/diskstats:/proc/diskstats:rw \
+                -v ${dir}/proc/meminfo:/proc/meminfo:rw \
+                -v ${dir}/proc/stat:/proc/stat:rw \
+                -v ${dir}/proc/uptime:/proc/uptime:rw"
+            break
+        fi
+    done
+fi
 
 # ======== 下载并加载镜像 ========
 tag_loaded_image() {
@@ -317,6 +405,7 @@ download_and_load_image() {
     local system_type="$1"
     local arch="$ARCH_TYPE"
     local tar_filename="spiritlhl_${system_type}_${arch}.tar.gz"
+    local tmp_tar
     # Podman 加载本地 tar 后镜像统一存储在 localhost/ 命名空间下
     local canonical_image="localhost/spiritlhl/${system_type}:latest"
 
@@ -327,18 +416,46 @@ download_and_load_image() {
         return 0
     fi
 
-    # 优先从 GitHub Releases 下载（支持 CDN 加速）
-    local github_url="https://github.com/oneclickvirt/podman/releases/download/${system_type}/${tar_filename}"
-    local download_url="${cdn_success_url}${github_url}"
+    # 优先从 GHCR 或自定义镜像仓库拉取，失败后回退到 GitHub Releases 离线包。
+    local ghcr_repo="${PODMAN_GHCR_IMAGE:-ghcr.io/oneclickvirt/podman}"
+    local ghcr_image="${ghcr_repo}:${system_type}-${arch}"
+    _yellow "Trying to pull image first: $ghcr_image"
+    if podman pull "$ghcr_image"; then
+        podman tag "$ghcr_image" "${canonical_image}" 2>/dev/null || true
+        if podman image exists "${canonical_image}" 2>/dev/null; then
+            export image_name="${canonical_image}"
+        else
+            export image_name="${ghcr_image}"
+        fi
+        _green "Image pulled: ${ghcr_image}"
+        return 0
+    fi
+
+    _yellow "Image pull failed, falling back to release tar"
+
+    # GitHub Releases 支持 CDN 加速，允许通过环境变量替换离线包源。
+    local default_release_base="https://github.com/oneclickvirt/podman/releases/download"
+    local release_base_url="${PODMAN_RELEASE_BASE_URL:-$default_release_base}"
+    local release_url="${release_base_url%/}/${system_type}/${tar_filename}"
+    local download_url="$release_url"
+    if [[ "$release_base_url" == "$default_release_base" ]]; then
+        download_url="${cdn_success_url}${release_url}"
+    fi
     _yellow "Downloading image: $download_url"
 
-    if curl -L --connect-timeout 15 --max-time 600 -o "/tmp/${tar_filename}" "$download_url" && \
-       [[ -f "/tmp/${tar_filename}" ]] && [[ -s "/tmp/${tar_filename}" ]]; then
+    tmp_tar=$(mktemp "/tmp/${tar_filename}.XXXXXX" 2>/dev/null || true)
+    if [[ -z "$tmp_tar" ]]; then
+        _red "Failed to allocate temporary image file"
+        exit 1
+    fi
+
+    if curl -L --connect-timeout 15 --max-time 600 -o "$tmp_tar" "$download_url" && \
+       [[ -f "$tmp_tar" ]] && [[ -s "$tmp_tar" ]]; then
         _yellow "Loading image from tar..."
         local load_output
-        if load_output=$(podman load -i "/tmp/${tar_filename}" 2>&1); then
+        if load_output=$(podman load -i "$tmp_tar" 2>&1); then
             printf '%s\n' "$load_output"
-            rm -f "/tmp/${tar_filename}"
+            rm -f "$tmp_tar"
             # 确保以 localhost/spiritlhl/<os>:latest 标记；只使用加载结果或已知候选 tag。
             if ! podman image exists "${canonical_image}" 2>/dev/null; then
                 tag_loaded_image "$system_type" "$canonical_image" "$load_output" || true
@@ -352,21 +469,11 @@ download_and_load_image() {
             return 0
         else
             _yellow "Failed to load tar, removing..."
-            rm -f "/tmp/${tar_filename}"
+            rm -f "$tmp_tar"
         fi
     else
         _yellow "CDN/direct download failed for ${download_url}"
-        rm -f "/tmp/${tar_filename}" 2>/dev/null
-    fi
-
-    # 回退：从 ghcr.io 拉取
-    local ghcr_image="ghcr.io/oneclickvirt/podman:${system_type}-${arch}"
-    _yellow "Trying to pull from ghcr.io: $ghcr_image"
-    if podman pull "$ghcr_image"; then
-        podman tag "$ghcr_image" "${canonical_image}" 2>/dev/null || true
-        export image_name="${canonical_image}"
-        _green "Image pulled from ghcr.io: ${ghcr_image}"
-        return 0
+        rm -f "$tmp_tar" 2>/dev/null
     fi
 
     _red "Failed to obtain image for ${system_type}"
@@ -377,8 +484,14 @@ download_and_load_image() {
 download_and_copy_ssh_scripts() {
     local cname="$1"
     local sys_type="$2"
-    local base_url="${cdn_success_url}https://raw.githubusercontent.com/oneclickvirt/podman/main/scripts"
+    local default_script_base="https://raw.githubusercontent.com/oneclickvirt/podman/main/scripts"
+    local configured_script_base="${PODMAN_SCRIPT_BASE_URL:-$default_script_base}"
+    local base_url="$configured_script_base"
     local tmp_file
+
+    if [[ "$configured_script_base" == "$default_script_base" ]]; then
+        base_url="${cdn_success_url}${configured_script_base}"
+    fi
 
     if [[ "$sys_type" == "alpine" ]]; then
         tmp_file="/tmp/podman_${cname}_ssh_sh.sh"
@@ -410,7 +523,12 @@ main() {
     # 网络选项
     local net_opts=""
     local ipv6_env=""
-    if [[ "${independent_ipv6,,}" == "y" ]] && [[ "$IPV6_ENABLED" == "true" ]]; then
+    local pod_opts=""
+    local publish_opts="-p ${sshport}:22 -p ${startport}-${endport}:${startport}-${endport}"
+    if [[ "$ROOTLESS_MODE" == "true" ]]; then
+        net_opts=""
+        ipv6_env=""
+    elif [[ "$independent_ipv6" == "y" ]] && [[ "$IPV6_ENABLED" == "true" ]]; then
         net_opts="--network podman-ipv6"
         ipv6_env="-e IPV6_ENABLED=true"
     else
@@ -421,36 +539,63 @@ main() {
         fi
     fi
 
+    if [[ -n "${PODMAN_POD_NAME:-}" ]]; then
+        if [[ ! "$PODMAN_POD_NAME" =~ ^[a-zA-Z0-9][a-zA-Z0-9_.-]*$ ]]; then
+            _red "Invalid PODMAN_POD_NAME: ${PODMAN_POD_NAME}"
+            exit 1
+        fi
+        if podman pod exists "$PODMAN_POD_NAME" 2>/dev/null; then
+            if ! is_truthy "${PODMAN_POD_JOIN_EXISTING:-}"; then
+                _red "Pod ${PODMAN_POD_NAME} already exists. Set PODMAN_POD_JOIN_EXISTING=true to join it intentionally."
+                exit 1
+            fi
+            _yellow "Joining existing pod ${PODMAN_POD_NAME}; make sure container services do not conflict inside the shared network namespace"
+        else
+            # shellcheck disable=SC2086
+            if ! podman pod create \
+                --name "$PODMAN_POD_NAME" \
+                ${net_opts} \
+                -p "${sshport}:22" \
+                -p "${startport}-${endport}:${startport}-${endport}" >/dev/null; then
+                _red "Failed to create pod ${PODMAN_POD_NAME}"
+                exit 1
+            fi
+        fi
+        pod_opts="--pod ${PODMAN_POD_NAME}"
+        net_opts=""
+        publish_opts=""
+    fi
+
     # 磁盘限制选项（仅 btrfs 驱动支持）
     local storage_opts=""
     if [[ "$btrfs_support" == "Y" ]] && [[ "$disk" -gt 0 ]]; then
         storage_opts="--storage-opt size=${disk}g"
+    fi
+    local cap_opts=""
+    if [[ "$ROOTLESS_MODE" != "true" ]]; then
+        cap_opts="--cap-add=MKNOD --cap-add=NET_ADMIN --cap-add=NET_RAW"
     fi
 
     # CPU 限制（podman 使用 --cpus 与 docker 相同）
     # 内存限制
     # 运行容器
     # shellcheck disable=SC2086
-    podman run -d \
+    if ! podman run -d \
         --pull=never \
         --cpus="${cpu}" \
         --memory="${memory}m" \
         --memory-swap="${memory}m" \
         --name "${name}" \
+        ${pod_opts} \
         ${net_opts} \
-        -p "${sshport}:22" \
-        -p "${startport}-${endport}:${startport}-${endport}" \
-        --cap-add=MKNOD \
-        --cap-add=NET_ADMIN \
-        --cap-add=NET_RAW \
+        ${publish_opts} \
+        ${cap_opts} \
         --restart always \
         ${storage_opts} \
         ${lxcfs_volumes} \
         ${ipv6_env} \
         -e ROOT_PASSWORD="${passwd}" \
-        "${image_name}"
-
-    if [[ $? -ne 0 ]]; then
+        "${image_name}"; then
         _red "Failed to create container ${name}"
         exit 1
     fi
@@ -487,13 +632,19 @@ main() {
 
     sleep 2
 
-    # 记录容器信息
-    echo "$name $sshport $passwd $cpu $memory $startport $endport $disk" > "${name}"
-    cat "${name}"
+    # 记录容器信息。批量模式保留同名临时记录供 create_podman.sh 消费；单容器模式写入 ctlog。
+    local record
+    record="$name $sshport $passwd $cpu $memory $startport $endport $disk"
+    if is_truthy "${PODMAN_BATCH_MODE:-}"; then
+        printf "%s\n" "$record" > "${name}"
+    else
+        printf "%s\n" "$record" >> ctlog
+    fi
+    printf "%s\n" "$record"
 
     # 查询容器实际获得的 IPv6 地址（仅 IPv6 模式）
     local container_ipv6=""
-    if [[ "${independent_ipv6,,}" == "y" ]] && [[ "$IPV6_ENABLED" == "true" ]]; then
+    if [[ "$independent_ipv6" == "y" ]] && [[ "$IPV6_ENABLED" == "true" ]]; then
         container_ipv6=$(podman inspect -f \
             '{{range .NetworkSettings.Networks}}{{.GlobalIPv6Address}}{{end}}' \
             "${name}" 2>/dev/null || true)

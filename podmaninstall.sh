@@ -2,7 +2,6 @@
 # from
 # https://github.com/oneclickvirt/podman
 # 2026.03.01
-
 _red()    { echo -e "\033[31m\033[01m$*\033[0m"; }
 _green()  { echo -e "\033[32m\033[01m$*\033[0m"; }
 _yellow() { echo -e "\033[33m\033[01m$*\033[0m"; }
@@ -13,23 +12,17 @@ is_truthy() {
         *) return 1 ;;
     esac
 }
-is_noninteractive() {
-    is_truthy "${noninteractive:-${NONINTERACTIVE:-}}"
-}
-python_cmd() {
-    command -v python3 2>/dev/null || command -v python 2>/dev/null || true
-}
+is_noninteractive() { is_truthy "${noninteractive:-${NONINTERACTIVE:-}}"; }
+python_cmd() { command -v python3 2>/dev/null || command -v python 2>/dev/null || true; }
 reading() {
     is_noninteractive && return 1
     read -rp "$(_green "$1")" "$2"
 }
 export DEBIAN_FRONTEND=noninteractive
-
 WITHOUT_CDN=false
 if is_truthy "${WITHOUTCDN:-}"; then
     WITHOUT_CDN=true
 fi
-
 utf8_locale=$(locale -a 2>/dev/null | grep -i -m 1 -E "UTF-8|utf8")
 if [[ -z "$utf8_locale" ]]; then
     _yellow "No UTF-8 locale found"
@@ -38,7 +31,6 @@ else
     export LANG="$utf8_locale"
     export LANGUAGE="$utf8_locale"
 fi
-
 if [ "$(id -u)" != "0" ]; then
     _red "This script must be run as root" 1>&2
     exit 1
@@ -46,19 +38,9 @@ fi
 if [ ! -d /usr/local/bin ]; then
     mkdir -p /usr/local/bin
 fi
-
 # ======== 系统检测 ========
 REGEX=("debian" "ubuntu" "centos|red hat|kernel|oracle linux|alma|rocky" "'amazon linux'" "fedora" "arch" "alpine")
 RELEASE=("Debian" "Ubuntu" "CentOS" "CentOS" "Fedora" "Arch" "Alpine")
-PACKAGE_UPDATE=(
-    "! apt-get update && apt-get --fix-broken install -y && apt-get update"
-    "apt-get update"
-    "yum -y update"
-    "yum -y update"
-    "yum -y update"
-    "pacman -Sy"
-    "apk update"
-)
 PACKAGE_INSTALL=(
     "apt-get -y install"
     "apt-get -y install"
@@ -68,7 +50,6 @@ PACKAGE_INSTALL=(
     "pacman -Sy --noconfirm"
     "apk add --no-cache"
 )
-
 CMD=(
     "$(grep -i pretty_name /etc/os-release 2>/dev/null | cut -d \" -f2)"
     "$(hostnamectl 2>/dev/null | grep -i system | cut -d : -f2)"
@@ -95,7 +76,6 @@ if [[ -z $SYSTEM ]]; then
     _red "ERROR: The script does not support the current system!"
     exit 1
 fi
-
 # ======== 架构检测 ========
 ARCH_UNAME=$(uname -m)
 case "$ARCH_UNAME" in
@@ -107,27 +87,26 @@ case "$ARCH_UNAME" in
         exit 1
         ;;
 esac
-
 _blue "Detected system: $SYSTEM  arch: $ARCH_TYPE"
-
 # ======== CDN 检测 ========
 cdn_urls=("https://cdn0.spiritlhl.top/" "http://cdn1.spiritlhl.net/" "http://cdn2.spiritlhl.net/" "http://cdn3.spiritlhl.net/" "http://cdn4.spiritlhl.net/")
 cdn_success_url=""
-
+emit_cdn_urls() {
+    if command -v shuf >/dev/null 2>&1; then shuf -e "${cdn_urls[@]}"; else printf '%s\n' "${cdn_urls[@]}"; fi
+}
 check_cdn() {
     local o_url=$1
-    local shuffled_cdn_urls
-    shuffled_cdn_urls=($(shuf -e "${cdn_urls[@]}"))
-    for cdn_url in "${shuffled_cdn_urls[@]}"; do
+    local cdn_url
+    while IFS= read -r cdn_url; do
+        [[ -n "$cdn_url" ]] || continue
         if curl -4 -sL -k "${cdn_url}${o_url}" --max-time 6 | grep -q "success" >/dev/null 2>&1; then
             export cdn_success_url="$cdn_url"
             return
         fi
         sleep 0.5
-    done
+    done < <(emit_cdn_urls)
     export cdn_success_url=""
 }
-
 check_cdn_file() {
     if [[ "$WITHOUT_CDN" == "true" ]]; then
         export cdn_success_url=""
@@ -135,16 +114,21 @@ check_cdn_file() {
         return
     fi
     check_cdn "https://raw.githubusercontent.com/spiritLHLS/ecs/main/back/test"
-    if [ -n "$cdn_success_url" ]; then
-        _yellow "CDN available, using CDN: $cdn_success_url"
-    else
-        _yellow "No CDN available, using direct connection"
-    fi
+    if [ -n "$cdn_success_url" ]; then _yellow "CDN available, using CDN: $cdn_success_url"; else _yellow "No CDN available, using direct connection"; fi
 }
-
 check_cdn_file
-
 # ======== 工具函数 ========
+run_package_update() {
+    case $SYSTEM in
+        Debian)
+            if ! apt-get update 2>/dev/null; then apt-get --fix-broken install -y 2>/dev/null || true; apt-get update 2>/dev/null || true; fi
+            ;;
+        Ubuntu) apt-get update 2>/dev/null || true ;;
+        CentOS|Fedora) yum -y update 2>/dev/null || true ;;
+        Alpine) apk update 2>/dev/null || true ;;
+        Arch) pacman -Sy --noconfirm 2>/dev/null || true ;;
+    esac
+}
 update_sysctl() {
     local key="${1%%=*}"
     local val="${1##*=}"
@@ -156,7 +140,6 @@ update_sysctl() {
     fi
     sysctl -w "${key}=${val}" >/dev/null 2>&1 || true
 }
-
 is_private_ipv6() {
     local addr="$1"
     [[ "$addr" =~ ^fd ]] && return 0
@@ -165,7 +148,6 @@ is_private_ipv6() {
     [[ "$addr" =~ ^::1$ ]] && return 0
     return 1
 }
-
 # ======== 存储驱动检测与 btrfs 配置 ========
 check_storage_driver_support() {
     local driver="$1"
@@ -180,7 +162,6 @@ check_storage_driver_support() {
         *) return 1 ;;
     esac
 }
-
 setup_podman_btrfs_loop() {
     local pool_size_gb="$1"
     local loop_file="$2"
@@ -189,7 +170,6 @@ setup_podman_btrfs_loop() {
     local loop_dir
     loop_dir=$(dirname "$loop_file")
     [[ ! -d "$loop_dir" ]] && mkdir -p "$loop_dir"
-
     # 若 loop 文件已存在，优先尝试复用，避免重跑安装时覆盖已有容器数据。
     if [[ -f "$loop_file" ]]; then
         local loop_device
@@ -220,32 +200,29 @@ setup_podman_btrfs_loop() {
         else
             _yellow "Existing loop file could not be attached; backing it up before recreation."
         fi
-        local backup_loop_file="${loop_file}.backup.$(date +%Y%m%d-%H%M%S)"
+        local backup_loop_file
+        backup_loop_file="${loop_file}.backup.$(date +%Y%m%d-%H%M%S)"
         if ! mv "$loop_file" "$backup_loop_file" 2>/dev/null; then
             _red "Failed to back up existing loop file: $loop_file"
             return 1
         fi
         _yellow "Existing loop file backed up to: $backup_loop_file"
     fi
-
     if mountpoint -q "$mount_point" 2>/dev/null; then
         _green "Mount point $mount_point is already mounted, skipping creation."
         mkdir -p "$mount_point"
         echo "$mount_point" > /usr/local/bin/podman_mount_point
         return 0
     fi
-
     if [[ -d "$mount_point" ]] && [[ "$(ls -A "$mount_point" 2>/dev/null)" ]]; then
         _yellow "Backing up existing Podman data..."
         mv "$mount_point" "${mount_point}.backup.$(date +%Y%m%d-%H%M%S)"
     fi
-
     _yellow "Creating ${pool_size_gb}GB loop file at $loop_file..."
     fallocate -l "${pool_size_gb}G" "$loop_file"
     local loop_device
     loop_device=$(losetup --find --show "$loop_file")
     _green "Loop device created: $loop_device"
-
     _yellow "Formatting $loop_device as btrfs..."
     mkfs.btrfs -f "$loop_device"
     mkdir -p "$mount_point"
@@ -259,7 +236,6 @@ setup_podman_btrfs_loop() {
     echo "$loop_file"   > /usr/local/bin/podman_loop_file
     echo "$mount_point" > /usr/local/bin/podman_mount_point
 }
-
 try_podman_storage_drivers() {
     podman_need_disk_limit="false"
     if [[ -f /usr/local/bin/podman_need_disk_limit ]]; then
@@ -270,7 +246,6 @@ try_podman_storage_drivers() {
         _green "Using overlay storage driver (standard, no disk size limitation)"
         return 0
     fi
-
     # 安装 btrfs 工具
     _yellow "Installing btrfs-progs for disk size limitation support..."
     case $SYSTEM in
@@ -280,7 +255,6 @@ try_podman_storage_drivers() {
         Arch)          pacman -Sy --noconfirm btrfs-progs 2>/dev/null || true ;;
     esac
     modprobe btrfs 2>/dev/null || true
-
     if check_storage_driver_support "btrfs"; then
         echo "btrfs" > /usr/local/bin/podman_storage_driver
         _green "btrfs storage driver available, disk size limitation is supported"
@@ -291,7 +265,6 @@ try_podman_storage_drivers() {
         _yellow "Falling back to overlay for now. Reboot and re-run to activate btrfs."
     fi
 }
-
 # ======== 网络接口检测 ========
 detect_interface() {
     # 优先用 ip route get 8.8.8.8 获取出口网卡（最精准）
@@ -306,7 +279,6 @@ detect_interface() {
     fi
     _blue "Detected interface: ${interface:-unknown}"
     echo "${interface:-}" > /usr/local/bin/podman_main_interface
-
     # 保存宿主机公网 IPv4（供容器创建脚本展示 SSH 连接信息用）
     if [[ ! -f /usr/local/bin/podman_main_ipv4 ]]; then
         local main_ipv4
@@ -314,7 +286,6 @@ detect_interface() {
         echo "${main_ipv4:-}" > /usr/local/bin/podman_main_ipv4
     fi
 }
-
 # ======== IPv6 检测 ========
 check_ipv6() {
     IPV6=""
@@ -337,8 +308,7 @@ check_ipv6() {
         py_bin=$(python_cmd)
         for p in "${API_NET[@]}"; do
             local response
-            response=$(curl -sLk6m8 "$p" 2>/dev/null | tr -d '[:space:]')
-            if [[ $? -eq 0 ]] && [[ -n "$response" ]] && ! echo "$response" | grep -qi "error"; then
+            if response=$(curl -sLk6m8 "$p" 2>/dev/null | tr -d '[:space:]') && [[ -n "$response" ]] && ! echo "$response" | grep -qi "error"; then
                 # 验证是否为合法 IPv6 地址
                 if [[ -n "$py_bin" ]] && "$py_bin" -c "import ipaddress; ipaddress.IPv6Address('${response}')" 2>/dev/null; then
                     if ! is_private_ipv6 "$response"; then
@@ -360,13 +330,12 @@ check_ipv6() {
         echo "" > /usr/local/bin/podman_check_ipv6
     fi
 }
-
 # ======== 安装基础依赖 ========
 install_base_deps() {
     _yellow "Installing base dependencies..."
     case $SYSTEM in
         Debian|Ubuntu)
-            eval "${PACKAGE_UPDATE[int]}" 2>/dev/null || true
+            run_package_update
             ${PACKAGE_INSTALL[int]} curl wget ca-certificates nftables iproute2 \
                 socat unzip tar jq python3 2>/dev/null || true
             ;;
@@ -375,19 +344,18 @@ install_base_deps() {
                 socat unzip tar jq python3 2>/dev/null || true
             ;;
         Alpine)
-            ${PACKAGE_UPDATE[int]} 2>/dev/null || true
+            run_package_update
             ${PACKAGE_INSTALL[int]} curl wget ca-certificates nftables iproute2 \
                 socat unzip tar jq python3 2>/dev/null || true
             ;;
         Arch)
-            ${PACKAGE_UPDATE[int]} 2>/dev/null || true
+            run_package_update
             ${PACKAGE_INSTALL[int]} curl wget ca-certificates nftables iproute2 \
                 socat unzip tar jq python 2>/dev/null || true
             ;;
     esac
     _green "Base dependencies installed"
 }
-
 # ======== 检测防火墙后端 ========
 detect_firewall_backend() {
     FIREWALL_BACKEND="nftables"
@@ -427,11 +395,9 @@ detect_firewall_backend() {
     fi
     echo "$FIREWALL_BACKEND" > /usr/local/bin/podman_firewall_backend
 }
-
 # ======== 安装 Podman ========
 install_podman() {
     _yellow "Installing Podman..."
-
     if command -v podman >/dev/null 2>&1; then
         local _pver
         _pver=$(podman --version 2>/dev/null || true)
@@ -442,14 +408,14 @@ install_podman() {
         fi
         return 0
     fi
-
     case $SYSTEM in
         Ubuntu)
-            eval "${PACKAGE_UPDATE[int]}" 2>/dev/null || true
+            run_package_update
             # Ubuntu 22.04+ 直接有 podman
             ${PACKAGE_INSTALL[int]} podman 2>/dev/null || true
             # 若版本过旧则添加 kubic 源
             if ! command -v podman >/dev/null 2>&1; then
+                # shellcheck disable=SC1091
                 . /etc/os-release
                 echo "deb https://download.opensuse.org/repositories/devel:/kubic:/libcontainers:/stable/xUbuntu_${VERSION_ID}/ /" \
                     > /etc/apt/sources.list.d/devel:kubic:libcontainers:stable.list
@@ -459,9 +425,10 @@ install_podman() {
             fi
             ;;
         Debian)
-            eval "${PACKAGE_UPDATE[int]}" 2>/dev/null || true
+            run_package_update
             ${PACKAGE_INSTALL[int]} podman 2>/dev/null || true
             if ! command -v podman >/dev/null 2>&1; then
+                # shellcheck disable=SC1091
                 . /etc/os-release
                 echo "deb https://download.opensuse.org/repositories/devel:/kubic:/libcontainers:/stable/Debian_${VERSION_ID}/ /" \
                     > /etc/apt/sources.list.d/devel:kubic:libcontainers:stable.list
@@ -485,7 +452,6 @@ install_podman() {
             pacman -Sy --noconfirm podman 2>/dev/null || true
             ;;
     esac
-
     if command -v podman >/dev/null 2>&1; then
         _green "Podman installed: $(podman --version)"
     else
@@ -493,26 +459,32 @@ install_podman() {
         exit 1
     fi
 }
-
 # ======== 配置 Podman 存储 ========
 configure_podman_storage() {
     _yellow "Configuring Podman storage..."
     mkdir -p /etc/containers
-
     # 读取存储驱动配置（由 try_podman_storage_drivers 写入）
     local storage_driver="overlay"
     if [[ -f /usr/local/bin/podman_storage_driver ]]; then
         storage_driver=$(cat /usr/local/bin/podman_storage_driver)
     fi
-
     # 读取 btrfs 挂载点（存储根目录）
     local graph_root="/var/lib/containers/storage"
+    if [[ -f /usr/local/bin/podman_install_path ]]; then
+        local configured_graph_root
+        configured_graph_root=$(cat /usr/local/bin/podman_install_path 2>/dev/null || true)
+        [[ -n "$configured_graph_root" ]] && graph_root="$configured_graph_root"
+    fi
     if [[ "$storage_driver" == "btrfs" ]] && [[ -f /usr/local/bin/podman_mount_point ]]; then
         local _mp
         _mp=$(cat /usr/local/bin/podman_mount_point)
         [[ -n "$_mp" ]] && graph_root="$_mp"
     fi
-
+    mkdir -p "$graph_root" 2>/dev/null || true
+    if [[ "$graph_root" != "/var/lib/containers/storage" ]] && command -v semanage >/dev/null 2>&1 && command -v restorecon >/dev/null 2>&1; then
+        semanage fcontext -a -e /var/lib/containers "$graph_root" 2>/dev/null || true
+        restorecon -R "$graph_root" 2>/dev/null || true
+    fi
     # 配置 containers.conf
     cat > /etc/containers/containers.conf <<EOF
 [containers]
@@ -532,43 +504,35 @@ default_capabilities = [
     "NET_RAW",
     "NET_ADMIN",
 ]
-
 [network]
 network_backend = "netavark"
 firewall_driver = "${FIREWALL_BACKEND}"
-
 [engine]
 cgroup_manager = "systemd"
 events_logger = "journald"
 EOF
-
     # 配置 storage.conf（覆盖写入，确保驱动与路径正确）
     cat > /etc/containers/storage.conf <<EOF
 [storage]
 driver = "${storage_driver}"
 runroot = "/run/containers/storage"
-graphRoot = "${graph_root}"
-
+graphroot = "${graph_root}"
 [storage.options]
 additionalimagestores = []
-
 [storage.options.overlay]
 mountopt = "nodev"
 EOF
-
     if [[ "$storage_driver" == "btrfs" ]]; then
-        _green "Podman storage configured: driver=btrfs, graphRoot=${graph_root}  (disk size limitation ENABLED)"
+        _green "Podman storage configured: driver=btrfs, graphroot=${graph_root}  (disk size limitation ENABLED)"
     else
         _green "Podman storage configured: driver=overlay (standard, no disk size limitation)"
     fi
-
     # 配置 registries.conf（添加默认搜索路径）
     if [[ ! -f /etc/containers/registries.conf ]]; then
         cat > /etc/containers/registries.conf <<'EOF'
 unqualified-search-registries = ["docker.io", "ghcr.io", "quay.io"]
 EOF
     fi
-
     # 确保 policy.json 存在
     if [[ ! -f /etc/containers/policy.json ]]; then
         cat > /etc/containers/policy.json <<'EOF'
@@ -590,13 +554,10 @@ EOF
 }
 EOF
     fi
-
     # 确保 overlay 内核模块加载
     modprobe overlay 2>/dev/null || true
-
     _green "Podman storage configured"
 }
-
 # ======== 配置内核参数 ========
 configure_kernel() {
     _yellow "Configuring kernel parameters..."
@@ -612,16 +573,50 @@ configure_kernel() {
     sysctl --system >/dev/null 2>&1 || true
     _green "Kernel parameters configured"
 }
-
+ensure_subid_range() {
+    local file="$1"
+    local user="$2"
+    local start="$3"
+    [[ -n "$file" && -n "$user" && -n "$start" ]] || return 0
+    touch "$file" 2>/dev/null || return 0
+    if ! awk -F: -v wanted_user="$user" '$1 == wanted_user { found=1 } END { exit found ? 0 : 1 }' "$file" 2>/dev/null; then
+        echo "${user}:${start}:65536" >> "$file"
+    fi
+}
+configure_rootless_user() {
+    local rootless_user="${PODMAN_ROOTLESS_USER:-}" subuid_start="${PODMAN_ROOTLESS_SUBUID_START:-100000}" subgid_start="${PODMAN_ROOTLESS_SUBGID_START:-100000}"
+    [[ -n "$rootless_user" ]] || return 0
+    if [[ ! "$rootless_user" =~ ^[a-zA-Z_][a-zA-Z0-9_.-]*$ ]]; then
+        _yellow "Invalid PODMAN_ROOTLESS_USER=${rootless_user}, skipping rootless setup"
+        return 0
+    fi
+    if [[ ! "$subuid_start" =~ ^[0-9]+$ || ! "$subgid_start" =~ ^[0-9]+$ ]]; then
+        _yellow "Invalid rootless subuid/subgid start, using defaults 100000:100000"
+        subuid_start="100000"
+        subgid_start="100000"
+    fi
+    if ! id "$rootless_user" >/dev/null 2>&1; then
+        if is_truthy "${PODMAN_ROOTLESS_CREATE_USER:-}"; then
+            if command -v useradd >/dev/null 2>&1; then useradd -m "$rootless_user" 2>/dev/null || true; elif command -v adduser >/dev/null 2>&1; then adduser -D "$rootless_user" 2>/dev/null || true; fi
+        fi
+    fi
+    if ! id "$rootless_user" >/dev/null 2>&1; then
+        _yellow "Rootless user ${rootless_user} does not exist; set PODMAN_ROOTLESS_CREATE_USER=true or create it manually"
+        return 0
+    fi
+    ensure_subid_range /etc/subuid "$rootless_user" "$subuid_start"
+    ensure_subid_range /etc/subgid "$rootless_user" "$subgid_start"
+    if command -v loginctl >/dev/null 2>&1; then loginctl enable-linger "$rootless_user" 2>/dev/null || true; fi
+    echo "$rootless_user" > /usr/local/bin/podman_rootless_user
+    _green "Rootless Podman user configured: ${rootless_user}"
+}
 # ======== 创建 Podman IPv4 网络 ========
 create_podman_network() {
     _yellow "Creating Podman IPv4 network (podman-net)..."
-
     if podman network exists podman-net 2>/dev/null; then
         _green "podman-net already exists"
         return 0
     fi
-
     podman network create \
         --driver bridge \
         --interface-name podman-br0 \
@@ -633,14 +628,12 @@ create_podman_network() {
         --subnet 172.20.0.0/16 \
         --gateway 172.20.0.1 \
         podman-net 2>/dev/null || true
-
     if podman network exists podman-net 2>/dev/null; then
         _green "podman-net created (172.20.0.0/16)"
     else
         _yellow "Warning: podman-net creation may have failed, check manually"
     fi
 }
-
 # ======== 配置 IPv6 内核参数 ========
 adapt_ipv6() {
     _yellow "Configuring IPv6 kernel parameters..."
@@ -652,22 +645,22 @@ adapt_ipv6() {
     fi
     sysctl --system >/dev/null 2>&1 || true
 }
-
 # ======== 创建 Podman IPv6 双栈网络 ========
 create_ipv6_network() {
     local ipv6_addr="$1"
     _yellow "Creating Podman IPv6 dual-stack network (podman-ipv6)..."
-
     if podman network exists podman-ipv6 2>/dev/null; then
         _green "podman-ipv6 already exists"
         return 0
     fi
-
     # 依次尝试 /96 → /80 → /64，选取 netavark 支持的最小可用前缀。
     local prefix=""
     local _plen
     local py_bin
+    local net_err
     py_bin=$(python_cmd)
+    net_err=$(mktemp /tmp/podman-net.XXXXXX 2>/dev/null || true)
+    [[ -n "$net_err" ]] || net_err="/tmp/podman-net.$$"
     for _plen in 96 80 64; do
         prefix=""
         if [[ -n "$py_bin" ]]; then
@@ -687,12 +680,9 @@ except Exception:
             _seg4=$(echo "$ipv6_addr" | awk -F: '{print $1":"$2":"$3":"$4}')
             prefix="${_seg4}::/${_plen}"
         fi
-
         [[ -z "$prefix" ]] && continue
-
         echo "$prefix" > /usr/local/bin/podman_ipv6_subnet
         _yellow "Trying IPv6 subnet for podman-ipv6: ${prefix}"
-
         # 尝试1：带 interface-name，--ipv6 先于 subnet（netavark 推荐顺序）
         if podman network create \
             --driver bridge \
@@ -701,12 +691,12 @@ except Exception:
             --subnet 172.21.0.0/16 \
             --gateway 172.21.0.1 \
             --subnet "${prefix}" \
-            podman-ipv6 2>/tmp/podman_net_err; then
+            podman-ipv6 2>"$net_err"; then
             _green "podman-ipv6 created (prefix /${_plen}, attempt 1): IPv4=172.21.0.0/16, IPv6=${prefix}"
+            rm -f "$net_err" 2>/dev/null || true
             return 0
         fi
-        _yellow "Prefix /${_plen} attempt 1 failed: $(cat /tmp/podman_net_err 2>/dev/null)"
-
+        _yellow "Prefix /${_plen} attempt 1 failed: $(cat "$net_err" 2>/dev/null)"
         # 尝试2：不带 interface-name
         if podman network create \
             --driver bridge \
@@ -714,29 +704,29 @@ except Exception:
             --subnet 172.21.0.0/16 \
             --gateway 172.21.0.1 \
             --subnet "${prefix}" \
-            podman-ipv6 2>/tmp/podman_net_err; then
+            podman-ipv6 2>"$net_err"; then
             _green "podman-ipv6 created (prefix /${_plen}, attempt 2): IPv4=172.21.0.0/16, IPv6=${prefix}"
+            rm -f "$net_err" 2>/dev/null || true
             return 0
         fi
-        _yellow "Prefix /${_plen} attempt 2 failed: $(cat /tmp/podman_net_err 2>/dev/null)"
-
+        _yellow "Prefix /${_plen} attempt 2 failed: $(cat "$net_err" 2>/dev/null)"
         # 尝试3：仅 IPv6 子网（不含 IPv4 双栈）
         if podman network create \
             --driver bridge \
             --ipv6 \
             --subnet "${prefix}" \
-            podman-ipv6 2>/tmp/podman_net_err; then
+            podman-ipv6 2>"$net_err"; then
             _green "podman-ipv6 created (prefix /${_plen}, attempt 3, IPv6-only): IPv6=${prefix}"
+            rm -f "$net_err" 2>/dev/null || true
             return 0
         fi
-        _yellow "Prefix /${_plen} attempt 3 failed: $(cat /tmp/podman_net_err 2>/dev/null)"
+        _yellow "Prefix /${_plen} attempt 3 failed: $(cat "$net_err" 2>/dev/null)"
     done
-
     _yellow "Warning: podman-ipv6 creation failed, check manually"
     echo "" > /usr/local/bin/podman_ipv6_subnet
+    rm -f "$net_err" 2>/dev/null || true
     return 1
 }
-
 # ======== 启动 NDP Responder ========
 start_ndpresponder() {
     _yellow "Starting NDP responder for IPv6..."
@@ -746,25 +736,20 @@ start_ndpresponder() {
         arm64) arch_tag="arm64" ;;
         *)     arch_tag="x86" ;;
     esac
-
     local ndp_image="spiritlhl/ndpresponder_${arch_tag}"
-
     podman rm -f ndpresponder 2>/dev/null || true
-
     # 预先拉取镜像，避免 podman run 超时
     _yellow "Pulling ndpresponder image: ${ndp_image}"
     if ! podman pull "${ndp_image}" 2>/dev/null; then
         # 尝试带 CDN 的 docker.io 路径
         podman pull "docker.io/${ndp_image}" 2>/dev/null || true
     fi
-
     # 确认 podman-ipv6 网络存在后再启动
     if ! podman network exists podman-ipv6 2>/dev/null; then
         _yellow "podman-ipv6 network not found, skipping ndpresponder"
         return 1
     fi
-
-    podman run -d \
+    if podman run -d \
         --restart always \
         --cpus 0.02 \
         --memory 64m \
@@ -774,31 +759,42 @@ start_ndpresponder() {
         --network host \
         --name ndpresponder \
         "${ndp_image}" \
-        -i "${interface}" -N podman-ipv6 2>/dev/null \
-    && _green "NDP responder started" \
-    || _yellow "ndpresponder start failed; IPv6 may require manual NDP configuration"
+        -i "${interface}" -N podman-ipv6 2>/dev/null; then
+        _green "NDP responder started"
+    else
+        _yellow "ndpresponder start failed; IPv6 may require manual NDP configuration"
+    fi
 }
-
 # ======== 配置 podman.socket 服务（可选，供 API 使用） ========
+systemd_unit_exists() {
+    local unit="$1"
+    systemctl list-unit-files "$unit" --no-legend 2>/dev/null | awk -v wanted="$unit" '$1 == wanted { found=1 } END { exit found ? 0 : 1 }'
+}
 setup_podman_socket() {
-    if systemctl list-unit-files podman.socket >/dev/null 2>&1; then
+    command -v systemctl >/dev/null 2>&1 || return 0
+    if systemd_unit_exists podman.socket; then
         systemctl enable --now podman.socket 2>/dev/null || true
         _green "podman.socket enabled"
     fi
-    if systemctl list-unit-files podman-restart.service >/dev/null 2>&1; then
+    if ! systemd_unit_exists podman-restart.service; then
+        printf '%s\n' "[Unit]" "Description=OneClickVirt Podman Restart Policy Containers" "Documentation=https://github.com/oneclickvirt/podman" "After=network-online.target" "Wants=network-online.target" "[Service]" "Type=oneshot" "RemainAfterExit=yes" \
+            "ExecStart=/bin/sh -c 'podman ps -aq --filter restart-policy=always 2>/dev/null | while IFS= read -r id; do [ -n \"\$id\" ] && podman start \"\$id\" || true; done'" \
+            "ExecStop=/bin/sh -c 'podman ps -aq --filter restart-policy=always 2>/dev/null | while IFS= read -r id; do [ -n \"\$id\" ] && podman stop \"\$id\" || true; done'" "[Install]" "WantedBy=multi-user.target" > /etc/systemd/system/podman-restart.service
+        systemctl daemon-reload 2>/dev/null || true
+    fi
+    if systemd_unit_exists podman-restart.service; then
         systemctl enable podman-restart.service 2>/dev/null || true
         _green "podman-restart.service enabled (containers with --restart auto-start on boot)"
     fi
 }
-
 # ======== DNS 保活服务 ========
 setup_dns_check() {
     _yellow "Setting up DNS liveness check service..."
-    cat > /usr/local/bin/check-dns-podman.sh <<'EOF'
+cat > /usr/local/bin/check-dns-podman.sh <<'EOF'
 #!/bin/bash
 # DNS liveness check for Podman containers
 while true; do
-    if ! nslookup github.com >/dev/null 2>&1; then
+    if ! { { command -v nslookup >/dev/null 2>&1 && nslookup github.com >/dev/null 2>&1; } || { command -v getent >/dev/null 2>&1 && getent hosts github.com >/dev/null 2>&1; } || ping -c 1 -W 2 github.com >/dev/null 2>&1; }; then
         if [[ -f /run/systemd/resolve/stub-resolv.conf ]]; then
             ln -sf /run/systemd/resolve/stub-resolv.conf /etc/resolv.conf 2>/dev/null || true
         fi
@@ -809,19 +805,16 @@ while true; do
 done
 EOF
     chmod +x /usr/local/bin/check-dns-podman.sh
-
     if [[ "$SYSTEM" != "Alpine" ]]; then
         cat > /etc/systemd/system/check-dns-podman.service <<'EOF'
 [Unit]
 Description=DNS Liveness Check for Podman
 After=network.target
-
 [Service]
 Type=simple
 ExecStart=/usr/local/bin/check-dns-podman.sh
 Restart=always
 RestartSec=30
-
 [Install]
 WantedBy=multi-user.target
 EOF
@@ -831,7 +824,6 @@ EOF
     fi
     _green "DNS check service configured"
 }
-
 # ======== 验证安装 ========
 verify_install() {
     _yellow "Verifying installation..."
@@ -859,7 +851,6 @@ verify_install() {
         fi
     fi
 }
-
 # ======== 主流程 ========
 main() {
     _blue "======================================================"
@@ -868,19 +859,16 @@ main() {
     _blue "  2026.03.01"
     _blue "======================================================"
     echo
-
     # 重新计算 int（系统类型索引）
     for ((int = 0; int < ${#REGEX[@]}; int++)); do
         if [[ $(echo "$SYS" | tr '[:upper:]' '[:lower:]') =~ ${REGEX[int]} ]]; then
             break
         fi
     done
-
     install_base_deps
     detect_interface
     check_ipv6
     detect_firewall_backend
-
     # ======== 硬盘限制支持询问 ========
     # 支持以下环境变量实现一键安装（跳过所有交互提示）：
     #   noninteractive=true            使用默认值跳过所有交互提示
@@ -888,7 +876,6 @@ main() {
     #   PODMAN_INSTALL_PATH=<path>     Podman 存储路径（默认 /var/lib/containers/storage）
     #   PODMAN_POOL_SIZE=<整数>        存储池大小，单位 GB（仅 NEED_DISK_LIMIT 启用时有效）
     #   PODMAN_LOOP_FILE=<path>        loop 镜像文件路径（默认 /opt/podman-pool.img）
-
     # --- 是否启用磁盘大小限制 ---
     if [[ -n "${NEED_DISK_LIMIT:-}" ]]; then
         if is_truthy "${NEED_DISK_LIMIT}"; then
@@ -908,7 +895,6 @@ main() {
         _blue "如果选择 'n'，则为标准Podman安装，无磁盘限制 / If 'n', standard Podman installation without disk limits"
         reading "Do you need container disk size limitation? ([n]/y): " _need_disk_limit_input
     fi
-
     # --- Podman 存储路径 ---
     if [[ -n "${PODMAN_INSTALL_PATH:-}" ]]; then
         _podman_install_path="${PODMAN_INSTALL_PATH}"
@@ -924,10 +910,8 @@ main() {
         _podman_install_path="/var/lib/containers/storage"
     fi
     echo "$_podman_install_path" > /usr/local/bin/podman_install_path
-
     if is_truthy "${_need_disk_limit_input:-}"; then
         echo "true" > /usr/local/bin/podman_need_disk_limit
-
         # --- 存储池大小 ---
         if [[ -n "${PODMAN_POOL_SIZE:-}" ]] && [[ "${PODMAN_POOL_SIZE}" =~ ^[1-9][0-9]*$ ]]; then
             _podman_pool_size="${PODMAN_POOL_SIZE}"
@@ -946,7 +930,6 @@ main() {
                 fi
             done
         fi
-
         # --- loop 文件路径 ---
         if [[ -n "${PODMAN_LOOP_FILE:-}" ]]; then
             _podman_loop_file="${PODMAN_LOOP_FILE}"
@@ -961,7 +944,6 @@ main() {
         if [[ -z "$_podman_loop_file" ]]; then
             _podman_loop_file="/opt/podman-pool.img"
         fi
-
         _green "将安装支持容器磁盘大小限制的Podman环境（btrfs存储驱动）"
         _green "Will install Podman with container disk size limitation support (btrfs storage driver)"
     else
@@ -971,9 +953,7 @@ main() {
         _green "将安装标准Podman，无容器磁盘大小限制功能"
         _green "Will install standard Podman without container disk size limitation"
     fi
-
     try_podman_storage_drivers
-
     # 若需要 btrfs loop 且存储驱动写入了 btrfs，则建立 loop 文件系统
     _podman_need_disk=$(cat /usr/local/bin/podman_need_disk_limit 2>/dev/null || echo "false")
     _current_driver=$(cat /usr/local/bin/podman_storage_driver 2>/dev/null || echo "overlay")
@@ -984,14 +964,13 @@ main() {
             exit 1
         fi
     fi
-
     install_podman
     configure_podman_storage
     configure_kernel
+    configure_rootless_user
     create_podman_network
     setup_podman_socket
     setup_dns_check
-
     if [[ "$IPV6_ENABLED" == true ]]; then
         adapt_ipv6
         if create_ipv6_network "$IPV6" && start_ndpresponder; then
@@ -1002,12 +981,9 @@ main() {
     else
         echo "false" > /usr/local/bin/podman_ipv6_enabled
     fi
-
     # 保存架构信息
     echo "$ARCH_TYPE" > /usr/local/bin/podman_arch
-
     verify_install
-
     echo
     _green "======================================================"
     _green "  ✓ Podman 安装完成！"
@@ -1021,5 +997,4 @@ main() {
     _yellow "  项目地址:  https://github.com/oneclickvirt/podman"
     echo
 }
-
 main "$@"

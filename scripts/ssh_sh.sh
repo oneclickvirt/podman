@@ -10,7 +10,17 @@ if [ "$(grep -E '^ID=' /etc/os-release 2>/dev/null | cut -d= -f2)" != "alpine" ]
     exit 1
 fi
 
-passwd_input="${1:-123456}"
+passwd_input="${1:-${ROOT_PASSWORD:-}}"
+if [ -z "$passwd_input" ]; then
+    echo "Password is required"
+    exit 1
+fi
+case "$passwd_input" in
+    *[[:space:]]*)
+        echo "Password must not contain whitespace"
+        exit 1
+        ;;
+esac
 
 # 处理 sshd_config.d/ 中的覆盖配置
 config_dir="/etc/ssh/sshd_config.d/"
@@ -66,7 +76,7 @@ fi
 mkdir -p /var/run/sshd
 
 # 设置 root 密码
-echo "root:${passwd_input}" | chpasswd 2>/dev/null || true
+printf "%s\n" "root:${passwd_input}" | chpasswd 2>/dev/null || true
 
 # 启动 sshd
 rc-update add sshd default 2>/dev/null || true
