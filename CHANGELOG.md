@@ -1,3 +1,8 @@
+2026.07.23
+- 修复批量创建在 btrfs 环境传递 `--storage-opt size=...` 导致 Podman 报 `unknown option size` 的问题
+- 单容器和批量创建统一改用 btrfs qgroup 设置容器 rootfs 磁盘上限，配额应用失败时自动删除未启动容器
+- 批量创建每次原子刷新缓存的 `onepodman.sh`，避免服务器残留旧脚本导致修复未生效
+
 2026.06.04
 - 调整容器镜像获取顺序为 GHCR/自定义镜像仓库优先，失败后回退 GitHub Releases 离线包
 - 修复 `PODMAN_INSTALL_PATH` 未写入 root Podman `storage.conf` 的问题，并使用 `graphroot` 键对齐 containers/storage 配置
@@ -54,5 +59,5 @@
 - 支持公网 IPv6 检测，自动创建 podman-ipv6 双栈网络，启动 NDP Responder 实现独立 IPv6
 - 支持国内 CDN 镜像加速（cdn.spiritlhl.net）
 - 支持 lxcfs 挂载（若宿主机安装了 lxcfs，提供容器内真实 /proc 视图）
-- 支持磁盘限制参数（需 overlay on xfs 支持 storage-opt）
+- 支持 btrfs qgroup 容器磁盘限制参数
 - Podman daemonless 架构，无需 containerd/Docker 守护进程

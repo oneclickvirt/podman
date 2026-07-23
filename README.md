@@ -90,9 +90,11 @@ chmod +x onepodman.sh
 | endport | 公网端口范围结束 | 35000 |
 | ipv6 | 是否分配独立 IPv6（y/n） | n |
 | system | 镜像系统 | debian |
-| disk_gb | 磁盘限制 GB（0=不限制） | 0 |
+| disk_gb | btrfs qgroup 磁盘限制 GB（0=不限制） | 0 |
 
 SSH 宿主机端口不能落在额外公网端口范围内，避免同一个宿主端口被重复映射。
+
+当宿主机使用 btrfs 且 `disk_gb` 大于 0 时，脚本会先创建容器，再对容器 rootfs 的 btrfs qgroup 设置上限后启动容器。Podman 的 `--storage-opt` 是全局存储配置参数，不能作为 `podman run` 的容器级磁盘限制参数使用；因此本项目不会把 `size=...` 直接传给 `podman run`。
 
 **支持的 system 参数：** `ubuntu` / `debian` / `alpine` / `almalinux` / `rockylinux` / `openeuler`
 
@@ -130,7 +132,7 @@ export PODMAN_IPV6=n
 | PODMAN_CREATE_COUNT | 新增容器数量，也兼容 PODMAN_CREATE_NUMS | 1 |
 | PODMAN_MEMORY_MB | 每个容器内存 MB | 512 |
 | PODMAN_CPU | 每个容器 CPU 核数 | 1 |
-| PODMAN_DISK_GB | 每个容器磁盘限制 GB，仅 btrfs 可用 | 0 |
+| PODMAN_DISK_GB | 每个容器磁盘限制 GB，仅 btrfs qgroup 可用 | 0 |
 | PODMAN_SYSTEM | 容器系统，支持 `debian12`/`debian/12` 等版本别名 | debian |
 | PODMAN_IPV6 | 是否分配独立 IPv6 | n |
 | PODMAN_CONTAINER_PREFIX | 容器名前缀 | ct |

@@ -513,6 +513,58 @@ download_and_copy_ssh_scripts() {
     rm -f "$tmp_file" 2>/dev/null || true
 }
 
+# ======== btrfs 磁盘配额 ========
+apply_btrfs_disk_limit() {
+    local cname="$1"
+    local size_gb="$2"
+    local rootfs=""
+    local mounted_by_script=false
+
+    if ! command -v btrfs >/dev/null 2>&1; then
+        _red "btrfs command not found; cannot apply the requested ${size_gb}GB disk limit"
+        return 1
+    fi
+
+    # btrfs containers/storage layers are subvolumes.  Prefer the path exposed
+    # by Podman and fall back to podman mount for versions that omit UpperDir.
+    rootfs=$(podman inspect -f '{{.GraphDriver.Data.UpperDir}}' "$cname" 2>/dev/null || true)
+    if [[ -z "$rootfs" || ! -d "$rootfs" ]]; then
+        rootfs=$(podman mount "$cname" 2>/dev/null || true)
+        [[ -n "$rootfs" ]] && mounted_by_script=true
+    fi
+    if [[ -z "$rootfs" || ! -d "$rootfs" ]]; then
+        [[ "$mounted_by_script" == "true" ]] && podman unmount "$cname" >/dev/null 2>&1 || true
+        _red "Unable to locate the btrfs rootfs for container ${cname}"
+        return 1
+    fi
+
+    if ! btrfs subvolume show "$rootfs" >/dev/null 2>&1; then
+        [[ "$mounted_by_script" == "true" ]] && podman unmount "$cname" >/dev/null 2>&1 || true
+        _red "Container ${cname} rootfs is not a btrfs subvolume: ${rootfs}"
+        return 1
+    fi
+
+    # Quota enable is idempotent at the filesystem level; older btrfs-progs
+    # return non-zero when quotas are already enabled, so the limit command is
+    # the authoritative operation below.
+    btrfs quota enable "$rootfs" >/dev/null 2>&1 || true
+    if ! btrfs qgroup limit "${size_gb}g" "$rootfs" >/dev/null 2>&1; then
+        [[ "$mounted_by_script" == "true" ]] && podman unmount "$cname" >/dev/null 2>&1 || true
+        _red "Failed to apply btrfs disk limit ${size_gb}GB to container ${cname}"
+        return 1
+    fi
+
+    if [[ "$mounted_by_script" == "true" ]]; then
+        podman unmount "$cname" >/dev/null 2>&1 || {
+            _red "Failed to unmount the temporary btrfs rootfs for container ${cname}"
+            return 1
+        }
+    fi
+
+    _green "Applied btrfs disk limit: ${size_gb}GB (${cname})"
+    return 0
+}
+
 # ======== 主逻辑 ========
 main() {
     _blue "Creating container: name=${name} cpu=${cpu} memory=${memory}MB system=${system}"
@@ -566,10 +618,15 @@ main() {
         publish_opts=""
     fi
 
-    # 磁盘限制选项（仅 btrfs 驱动支持）
-    local storage_opts=""
+    # Podman exposes --storage-opt as a global storage configuration flag, not
+    # as a container-level run/create option.  Passing size=... there makes the
+    # btrfs driver reject the command with "unknown option size".  Create the
+    # container first and apply a btrfs qgroup limit before starting it instead.
+    local podman_action="run"
+    local detach_opt="-d"
     if [[ "$btrfs_support" == "Y" ]] && [[ "$disk" -gt 0 ]]; then
-        storage_opts="--storage-opt size=${disk}g"
+        podman_action="create"
+        detach_opt=""
     fi
     local cap_opts=""
     if [[ "$ROOTLESS_MODE" != "true" ]]; then
@@ -580,7 +637,7 @@ main() {
     # 内存限制
     # 运行容器
     # shellcheck disable=SC2086
-    if ! podman run -d \
+    if ! podman "$podman_action" ${detach_opt} \
         --pull=never \
         --cpus="${cpu}" \
         --memory="${memory}m" \
@@ -591,13 +648,25 @@ main() {
         ${publish_opts} \
         ${cap_opts} \
         --restart always \
-        ${storage_opts} \
         ${lxcfs_volumes} \
         ${ipv6_env} \
         -e ROOT_PASSWORD="${passwd}" \
         "${image_name}"; then
         _red "Failed to create container ${name}"
         exit 1
+    fi
+
+    if [[ "$podman_action" == "create" ]]; then
+        if ! apply_btrfs_disk_limit "$name" "$disk"; then
+            podman rm -f "$name" >/dev/null 2>&1 || true
+            _red "Failed to create container ${name} with the requested disk limit"
+            exit 1
+        fi
+        if ! podman start "$name" >/dev/null; then
+            podman rm -f "$name" >/dev/null 2>&1 || true
+            _red "Failed to start container ${name} after applying the disk limit"
+            exit 1
+        fi
     fi
 
     _green "Container ${name} created successfully"

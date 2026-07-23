@@ -200,17 +200,37 @@ pre_check() {
     else
         scripts_home="/root/scripts"
     fi
-    if [[ ! -f "${scripts_home}/onepodman.sh" ]]; then
-        mkdir -p "$scripts_home" || {
-            _red "Failed to create scripts directory: ${scripts_home}"
+    mkdir -p "$scripts_home" || {
+        _red "Failed to create scripts directory: ${scripts_home}"
+        exit 1
+    }
+    if [[ -f "$local_onepodman" ]]; then
+        # Keep a colocated onepodman.sh and batch script in lockstep.
+        if ! bash -n "$local_onepodman"; then
+            _red "Invalid local onepodman.sh: ${local_onepodman}"
             exit 1
-        }
-        if [[ -f "$local_onepodman" ]]; then
-            cp "$local_onepodman" "${scripts_home}/onepodman.sh"
+        fi
+        if [[ "$local_onepodman" != "${scripts_home}/onepodman.sh" ]] && \
+           ! cp "$local_onepodman" "${scripts_home}/onepodman.sh"; then
+            _red "Failed to refresh onepodman.sh in ${scripts_home}"
+            exit 1
+        fi
+    else
+        # Refresh the cached helper on every batch invocation so an older
+        # /root/scripts/onepodman.sh cannot keep executing after an upgrade.
+        # Download into the same directory and replace atomically; retain a
+        # previously working cache when the remote source is unavailable.
+        local refreshed_onepodman
+        refreshed_onepodman=$(mktemp "${scripts_home}/.onepodman.sh.XXXXXX" 2>/dev/null || true)
+        if [[ -n "$refreshed_onepodman" ]] && \
+           curl -fsSL --connect-timeout 10 --max-time 60 \
+               "${script_base_url}/onepodman.sh" \
+               -o "$refreshed_onepodman" && [[ -s "$refreshed_onepodman" ]] && \
+           bash -n "$refreshed_onepodman"; then
+            chmod +x "$refreshed_onepodman"
+            mv -f "$refreshed_onepodman" "${scripts_home}/onepodman.sh"
         else
-            curl -sL --connect-timeout 10 --max-time 60 \
-                "${script_base_url}/onepodman.sh" \
-                -o "${scripts_home}/onepodman.sh"
+            rm -f "$refreshed_onepodman" 2>/dev/null || true
         fi
     fi
     if [[ ! -s "${scripts_home}/onepodman.sh" ]]; then
