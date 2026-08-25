@@ -63,6 +63,8 @@ bash <(wget -qO- https://raw.githubusercontent.com/oneclickvirt/podman/main/podm
 | PODMAN_ROOTLESS_CREATE_USER | 配合 PODMAN_ROOTLESS_USER 自动创建缺失用户 | false |
 | PODMAN_ROOTLESS_SUBUID_START | rootless subuid 起始值 | 100000 |
 | PODMAN_ROOTLESS_SUBGID_START | rootless subgid 起始值 | 100000 |
+| PODMAN_IPV6_SUBNET | 可选：显式指定已路由的公网 IPv6 子网；不能包含宿主机已绑定地址 | 自动从本机前缀选择 |
+| NDPRESPONDER_SOURCE_URL | responder 镜像拉取失败或架构不符时使用的 Git 构建源 | https://github.com/oneclickvirt/ndpresponder.git |
 
 ## 开设单个容器
 
@@ -221,7 +223,11 @@ bash <(wget -qO- https://raw.githubusercontent.com/oneclickvirt/podman/main/podm
 ## 网络说明
 
 - IPv4 网络名: `podman-net`，bridge: `podman-br0`，subnet: `172.20.0.0/16`
-- IPv6 双栈网络名: `podman-ipv6`，bridge: `podman-br1`，包含 172.21.0.0/16 + 公网 IPv6 /80 子网
+- IPv6 网络名: `podman-ipv6`，bridge: `podman-br1`。安装器只使用宿主机本地绑定的公网 IPv6 CIDR，不会把外部出口 API 返回的单个地址伪造成可分配网段。
+- 安装器会从宿主机前缀中选择不包含宿主地址的更小 sibling 子网。若 Netavark 因该子网仍与宿主机已绑定 `/64` 重叠而拒绝创建，安装器会创建并持久化自己拥有的 `mode=unmanaged` IPv6 bridge。
+- 在 `mode=unmanaged` 回退中，容器会同时接入 `podman-net` 与 `podman-ipv6`：前者保留 IPv4 NAT、`-p` 端口映射和 IPv4 默认路由；后者提供独立 IPv6，并显式添加 IPv6 默认路由而不新增 IPv4 默认路由。若 IPv6 网络或 NDP responder 未通过健康检查，创建脚本会自动仅使用 IPv4 网络。
+- `mode=unmanaged` 遵循 Netavark 的语义，不会为 IPv6 建立 NAT 或端口转发；公网 IPv6 直接路由到容器。若宿主机有默认拒绝的防火墙策略，需允许上联网卡与 `podman-br1` 之间对该 IPv6 子网的转发；IPv4 的 `-p` 端口映射仍由 `podman-net` 提供。
+- NDP responder 通过 Podman 的 Docker 兼容 API socket 跟踪 `podman-ipv6` 地址；它会在启动时验证 socket 和网络查询，失败或 responder 未运行时，IPv6 启用状态不会写为成功。
 - 与 containerd/docker 版本完全隔离，互不干扰
 
 ## 与 containerd/docker 版本对比

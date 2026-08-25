@@ -332,6 +332,7 @@ check_cdn_file
 
 # ======== IPv6 条件检测（三重：网络存在 + ndpresponder 运行 + 地址文件有值）========
 IPV6_ENABLED=false
+IPV6_NETWORK_MODE="managed"
 if [[ "$ROOTLESS_MODE" == "true" ]]; then
     if [[ "$independent_ipv6" == "y" ]]; then
         _yellow "Independent IPv6 network mode is not enabled for rootless Podman, falling back to rootless default network"
@@ -348,6 +349,24 @@ elif [[ -f /usr/local/bin/podman_ipv6_enabled ]] && \
             if [[ -f /usr/local/bin/podman_check_ipv6 ]] && \
                [[ -s /usr/local/bin/podman_check_ipv6 ]]; then
                 IPV6_ENABLED=true
+                if [[ -f /usr/local/bin/podman_ipv6_network_mode ]]; then
+                    IPV6_NETWORK_MODE=$(tr -d '[:space:]' </usr/local/bin/podman_ipv6_network_mode 2>/dev/null || true)
+                fi
+                case "$IPV6_NETWORK_MODE" in
+                    ""|managed)
+                        IPV6_NETWORK_MODE="managed"
+                        ;;
+                    unmanaged)
+                        if ! podman network exists podman-net 2>/dev/null; then
+                            _yellow "Podman unmanaged IPv6 network is missing podman-net; falling back to IPv4"
+                            IPV6_ENABLED=false
+                        fi
+                        ;;
+                    *)
+                        _yellow "Unknown Podman IPv6 network mode; falling back to IPv4"
+                        IPV6_ENABLED=false
+                        ;;
+                esac
             fi
         fi
     fi
@@ -581,7 +600,17 @@ main() {
         net_opts=""
         ipv6_env=""
     elif [[ "$independent_ipv6" == "y" ]] && [[ "$IPV6_ENABLED" == "true" ]]; then
-        net_opts="--network podman-ipv6"
+        if [[ "$IPV6_NETWORK_MODE" == "unmanaged" ]]; then
+            if ! podman network exists podman-net 2>/dev/null; then
+                _red "Independent IPv6 fallback requires the managed IPv4 podman-net network"
+                exit 1
+            fi
+            # The unmanaged network supplies the public IPv6 route.  Keep the
+            # managed IPv4 network first so Podman retains NAT and -p forwarding.
+            net_opts="--network podman-net --network podman-ipv6"
+        else
+            net_opts="--network podman-ipv6"
+        fi
         ipv6_env="-e IPV6_ENABLED=true"
     else
         if podman network exists podman-net 2>/dev/null; then
@@ -715,11 +744,11 @@ main() {
     local container_ipv6=""
     if [[ "$independent_ipv6" == "y" ]] && [[ "$IPV6_ENABLED" == "true" ]]; then
         container_ipv6=$(podman inspect -f \
-            '{{range .NetworkSettings.Networks}}{{.GlobalIPv6Address}}{{end}}' \
-            "${name}" 2>/dev/null || true)
+            '{{range .NetworkSettings.Networks}}{{if .GlobalIPv6Address}}{{.GlobalIPv6Address}}{{"\n"}}{{end}}{{end}}' \
+            "${name}" 2>/dev/null | awk 'NF {print; exit}' || true)
         [[ -z "$container_ipv6" ]] && container_ipv6=$(podman inspect -f \
-            '{{range .NetworkSettings.Networks}}{{.IPAddress}}{{end}}' \
-            "${name}" 2>/dev/null | grep -E '^[0-9a-f:]+:[0-9a-f:]+$' | head -1 || true)
+            '{{range .NetworkSettings.Networks}}{{if .IPAddress}}{{.IPAddress}}{{"\n"}}{{end}}{{end}}' \
+            "${name}" 2>/dev/null | awk '/:/ {print; exit}' || true)
     fi
 
     echo ""

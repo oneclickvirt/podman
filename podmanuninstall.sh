@@ -31,6 +31,15 @@ is_project_podman_restart_unit() {
     local unit_file="/etc/systemd/system/podman-restart.service"
     [[ -f "$unit_file" ]] && grep -q "OneClickVirt Podman Restart Policy Containers" "$unit_file" 2>/dev/null
 }
+is_project_ipv6_bridge_unit() {
+    local unit_file="/etc/systemd/system/podman-ipv6-bridge.service"
+    [[ -f "$unit_file" ]] && grep -q "OneClickVirt Podman unmanaged IPv6 bridge" "$unit_file" 2>/dev/null
+}
+
+# Set when an installer-owned unmanaged bridge cannot be deleted safely. The
+# ownership marker must outlive the uninstall so a subsequent install will not
+# mistake it for an arbitrary bridge and modify its attached interfaces.
+PODMAN_IPV6_BRIDGE_RETAINED=false
 
 if [ "$(id -u)" != "0" ]; then
     _red "This script must be run as root"
@@ -123,11 +132,24 @@ if command -v systemctl >/dev/null 2>&1; then
             systemctl disable podman-restart 2>/dev/null || true
         fi
     fi
+    if is_project_ipv6_bridge_unit; then
+        if systemctl is-active --quiet podman-ipv6-bridge 2>/dev/null; then
+            systemctl stop podman-ipv6-bridge 2>/dev/null || true
+            _yellow "  已停止 podman-ipv6-bridge"
+        fi
+        if systemctl is-enabled --quiet podman-ipv6-bridge 2>/dev/null; then
+            systemctl disable podman-ipv6-bridge 2>/dev/null || true
+        fi
+    fi
 fi
 f=/etc/systemd/system/check-dns-podman.service
 [[ -f "$f" ]] && rm -f "$f" && _yellow "  删除 $f"
 f=/etc/systemd/system/podman-restart.service
 if is_project_podman_restart_unit; then
+    rm -f "$f" && _yellow "  删除 $f"
+fi
+f=/etc/systemd/system/podman-ipv6-bridge.service
+if is_project_ipv6_bridge_unit; then
     rm -f "$f" && _yellow "  删除 $f"
 fi
 if command -v systemctl >/dev/null 2>&1; then
@@ -144,14 +166,33 @@ if command -v podman >/dev/null 2>&1; then
         fi
     done
 fi
-# 删除残留网桥
-for br in podman-br0 podman-br1; do
-    if ip link show "$br" >/dev/null 2>&1; then
-        ip link set "$br" down 2>/dev/null || true
-        ip link delete "$br" 2>/dev/null || true
-        _yellow "  删除网桥: $br"
+# 删除由常规 Podman 网络留下的残留网桥。
+if ip link show podman-br0 >/dev/null 2>&1; then
+    ip link set podman-br0 down 2>/dev/null || true
+    ip link delete podman-br0 2>/dev/null || true
+    _yellow "  删除网桥: podman-br0"
+fi
+# podman-br1 can be an unmanaged public IPv6 bridge.  Delete it only when this
+# installer created it, and retain it if another process still has ports attached.
+if [[ "$(cat /usr/local/bin/podman_ipv6_bridge_owned 2>/dev/null)" == "true" ]]; then
+    if ip link show podman-br1 >/dev/null 2>&1; then
+        if ip -o link show master podman-br1 2>/dev/null | grep -q .; then
+            _yellow "  podman-br1 still has attached interfaces; leaving it in place"
+            PODMAN_IPV6_BRIDGE_RETAINED=true
+        else
+            ip link set podman-br1 down 2>/dev/null || true
+            ip link delete podman-br1 2>/dev/null || true
+            if ip link show podman-br1 >/dev/null 2>&1; then
+                _yellow "  podman-br1 could not be deleted; preserving its ownership marker"
+                PODMAN_IPV6_BRIDGE_RETAINED=true
+            else
+                _yellow "  删除网桥: podman-br1"
+            fi
+        fi
     fi
-done
+elif ip link show podman-br1 >/dev/null 2>&1; then
+    _yellow "  podman-br1 is not marked as installer-owned; leaving it in place"
+fi
 
 # ======== 5.5. 持久化防火墙规则（如果使用 iptables） ========
 if [[ -f /usr/local/bin/podman_firewall_backend ]]; then
@@ -201,8 +242,13 @@ if [[ -f /usr/local/bin/podman_loop_file ]]; then
 fi
 # 删除所有 podman 状态文件
 for f in /usr/local/bin/podman_*; do
+    if [[ "$PODMAN_IPV6_BRIDGE_RETAINED" == "true" && "$f" == "/usr/local/bin/podman_ipv6_bridge_owned" ]]; then
+        _yellow "  保留 $f，避免重装时接管仍在使用的 podman-br1"
+        continue
+    fi
     [[ -f "$f" ]] && rm -f "$f" && _yellow "  删除 $f"
 done
+[[ -f /usr/local/bin/podman-ipv6-bridge.sh ]] && rm -f /usr/local/bin/podman-ipv6-bridge.sh && _yellow "  删除 /usr/local/bin/podman-ipv6-bridge.sh"
 [[ -f /usr/local/bin/check-dns-podman.sh ]] && rm -f /usr/local/bin/check-dns-podman.sh && _yellow "  删除 /usr/local/bin/check-dns-podman.sh"
 rm -f /tmp/spiritlhl_*.tar.gz 2>/dev/null || true
 rm -f /tmp/ssh_bash.sh /tmp/ssh_sh.sh 2>/dev/null || true
