@@ -1,13 +1,17 @@
 #!/bin/bash
 # from
 # https://github.com/oneclickvirt/podman
-# 2026.03.01
+# 2026.08.26
 # 完整卸载 Podman 环境及所有容器
 
 _red()    { echo -e "\033[31m\033[01m$*\033[0m"; }
 _green()  { echo -e "\033[32m\033[01m$*\033[0m"; }
 _yellow() { echo -e "\033[33m\033[01m$*\033[0m"; }
 _blue()   { echo -e "\033[36m\033[01m$*\033[0m"; }
+PODMAN_STATE_DIR="${PODMAN_STATE_DIR:-/usr/local/bin}"
+podman_state_file() {
+    printf '%s/%s\n' "${PODMAN_STATE_DIR%/}" "$1"
+}
 is_truthy() {
     case "${1:-}" in
         [Tt][Rr][Uu][Ee]|1|[Yy][Ee][Ss]|[Yy]) return 0 ;;
@@ -34,6 +38,10 @@ is_project_podman_restart_unit() {
 is_project_ipv6_bridge_unit() {
     local unit_file="/etc/systemd/system/podman-ipv6-bridge.service"
     [[ -f "$unit_file" ]] && grep -q "OneClickVirt Podman unmanaged IPv6 bridge" "$unit_file" 2>/dev/null
+}
+is_project_ipv6_attach_unit() {
+    local unit_file="/etc/systemd/system/podman-ipv6-attach.service"
+    [[ -f "$unit_file" ]] && grep -q "Restore OneClickVirt Podman routed IPv6 addresses" "$unit_file" 2>/dev/null
 }
 
 # Set when an installer-owned unmanaged bridge cannot be deleted safely. The
@@ -141,6 +149,15 @@ if command -v systemctl >/dev/null 2>&1; then
             systemctl disable podman-ipv6-bridge 2>/dev/null || true
         fi
     fi
+    if is_project_ipv6_attach_unit; then
+        if systemctl is-active --quiet podman-ipv6-attach 2>/dev/null; then
+            systemctl stop podman-ipv6-attach 2>/dev/null || true
+            _yellow "  已停止 podman-ipv6-attach"
+        fi
+        if systemctl is-enabled --quiet podman-ipv6-attach 2>/dev/null; then
+            systemctl disable podman-ipv6-attach 2>/dev/null || true
+        fi
+    fi
 fi
 f=/etc/systemd/system/check-dns-podman.service
 [[ -f "$f" ]] && rm -f "$f" && _yellow "  删除 $f"
@@ -150,6 +167,10 @@ if is_project_podman_restart_unit; then
 fi
 f=/etc/systemd/system/podman-ipv6-bridge.service
 if is_project_ipv6_bridge_unit; then
+    rm -f "$f" && _yellow "  删除 $f"
+fi
+f=/etc/systemd/system/podman-ipv6-attach.service
+if is_project_ipv6_attach_unit; then
     rm -f "$f" && _yellow "  删除 $f"
 fi
 if command -v systemctl >/dev/null 2>&1; then
@@ -174,7 +195,7 @@ if ip link show podman-br0 >/dev/null 2>&1; then
 fi
 # podman-br1 can be an unmanaged public IPv6 bridge.  Delete it only when this
 # installer created it, and retain it if another process still has ports attached.
-if [[ "$(cat /usr/local/bin/podman_ipv6_bridge_owned 2>/dev/null)" == "true" ]]; then
+if [[ "$(cat "$(podman_state_file podman_ipv6_bridge_owned)" 2>/dev/null)" == "true" ]]; then
     if ip link show podman-br1 >/dev/null 2>&1; then
         if ip -o link show master podman-br1 2>/dev/null | grep -q .; then
             _yellow "  podman-br1 still has attached interfaces; leaving it in place"
@@ -241,14 +262,15 @@ if [[ -f /usr/local/bin/podman_loop_file ]]; then
     fi
 fi
 # 删除所有 podman 状态文件
-for f in /usr/local/bin/podman_*; do
-    if [[ "$PODMAN_IPV6_BRIDGE_RETAINED" == "true" && "$f" == "/usr/local/bin/podman_ipv6_bridge_owned" ]]; then
+for f in "${PODMAN_STATE_DIR%/}"/podman_*; do
+    if [[ "$PODMAN_IPV6_BRIDGE_RETAINED" == "true" && "$f" == "$(podman_state_file podman_ipv6_bridge_owned)" ]]; then
         _yellow "  保留 $f，避免重装时接管仍在使用的 podman-br1"
         continue
     fi
     [[ -f "$f" ]] && rm -f "$f" && _yellow "  删除 $f"
 done
 [[ -f /usr/local/bin/podman-ipv6-bridge.sh ]] && rm -f /usr/local/bin/podman-ipv6-bridge.sh && _yellow "  删除 /usr/local/bin/podman-ipv6-bridge.sh"
+[[ -f /usr/local/bin/podman-ipv6-attach.sh ]] && rm -f /usr/local/bin/podman-ipv6-attach.sh && _yellow "  删除 /usr/local/bin/podman-ipv6-attach.sh"
 [[ -f /usr/local/bin/check-dns-podman.sh ]] && rm -f /usr/local/bin/check-dns-podman.sh && _yellow "  删除 /usr/local/bin/check-dns-podman.sh"
 rm -f /tmp/spiritlhl_*.tar.gz 2>/dev/null || true
 rm -f /tmp/ssh_bash.sh /tmp/ssh_sh.sh 2>/dev/null || true

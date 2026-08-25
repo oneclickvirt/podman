@@ -1,7 +1,7 @@
 #!/bin/bash
 # from
 # https://github.com/oneclickvirt/podman
-# 2026.03.01
+# 2026.08.26
 
 # Usage:
 # ./onepodman.sh <name> <cpu> <memory_mb> <password> <sshport> <startport> <endport> [independent_ipv6:y/n] [system] [disk_gb]
@@ -11,6 +11,10 @@ _red()    { echo -e "\033[31m\033[01m$*\033[0m"; }
 _green()  { echo -e "\033[32m\033[01m$*\033[0m"; }
 _yellow() { echo -e "\033[33m\033[01m$*\033[0m"; }
 _blue()   { echo -e "\033[36m\033[01m$*\033[0m"; }
+PODMAN_STATE_DIR="${PODMAN_STATE_DIR:-/usr/local/bin}"
+podman_state_file() {
+    printf '%s/%s\n' "${PODMAN_STATE_DIR%/}" "$1"
+}
 is_truthy() {
     case "${1:-}" in
         [Tt][Rr][Uu][Ee]|1|[Yy][Ee][Ss]|[Yy]) return 0 ;;
@@ -338,19 +342,19 @@ if [[ "$ROOTLESS_MODE" == "true" ]]; then
         _yellow "Independent IPv6 network mode is not enabled for rootless Podman, falling back to rootless default network"
         independent_ipv6="n"
     fi
-elif [[ -f /usr/local/bin/podman_ipv6_enabled ]] && \
-     [[ "$(cat /usr/local/bin/podman_ipv6_enabled)" == "true" ]]; then
+elif [[ -f "$(podman_state_file podman_ipv6_enabled)" ]] && \
+     [[ "$(cat "$(podman_state_file podman_ipv6_enabled)")" == "true" ]]; then
     # 条件1：podman-ipv6 网络存在
     if podman network exists podman-ipv6 2>/dev/null; then
         # 条件2：ndpresponder 容器正在运行
         ndp_status=$(podman inspect -f '{{.State.Status}}' ndpresponder 2>/dev/null || echo "")
         if [[ "$ndp_status" == "running" ]]; then
             # 条件3：IPv6 地址文件有值
-            if [[ -f /usr/local/bin/podman_check_ipv6 ]] && \
-               [[ -s /usr/local/bin/podman_check_ipv6 ]]; then
+            if [[ -f "$(podman_state_file podman_check_ipv6)" ]] && \
+               [[ -s "$(podman_state_file podman_check_ipv6)" ]]; then
                 IPV6_ENABLED=true
-                if [[ -f /usr/local/bin/podman_ipv6_network_mode ]]; then
-                    IPV6_NETWORK_MODE=$(tr -d '[:space:]' </usr/local/bin/podman_ipv6_network_mode 2>/dev/null || true)
+                if [[ -f "$(podman_state_file podman_ipv6_network_mode)" ]]; then
+                    IPV6_NETWORK_MODE=$(tr -d '[:space:]' <"$(podman_state_file podman_ipv6_network_mode)" 2>/dev/null || true)
                 fi
                 case "$IPV6_NETWORK_MODE" in
                     ""|managed)
@@ -359,6 +363,14 @@ elif [[ -f /usr/local/bin/podman_ipv6_enabled ]] && \
                     unmanaged)
                         if ! podman network exists podman-net 2>/dev/null; then
                             _yellow "Podman unmanaged IPv6 network is missing podman-net; falling back to IPv4"
+                            IPV6_ENABLED=false
+                        fi
+                        ;;
+                    manual)
+                        if ! podman network exists podman-net 2>/dev/null || \
+                           [[ ! -x /usr/local/bin/podman-ipv6-attach.sh ]] || \
+                           [[ ! -s "$(podman_state_file podman_ipv6_public_prefix)" ]]; then
+                            _yellow "Podman manual IPv6 network is missing its IPv4 network or attach helper; falling back to IPv4"
                             IPV6_ENABLED=false
                         fi
                         ;;
@@ -600,7 +612,7 @@ main() {
         net_opts=""
         ipv6_env=""
     elif [[ "$independent_ipv6" == "y" ]] && [[ "$IPV6_ENABLED" == "true" ]]; then
-        if [[ "$IPV6_NETWORK_MODE" == "unmanaged" ]]; then
+        if [[ "$IPV6_NETWORK_MODE" == "unmanaged" || "$IPV6_NETWORK_MODE" == "manual" ]]; then
             if ! podman network exists podman-net 2>/dev/null; then
                 _red "Independent IPv6 fallback requires the managed IPv4 podman-net network"
                 exit 1
@@ -698,6 +710,20 @@ main() {
         fi
     fi
 
+    if [[ "$IPV6_NETWORK_MODE" == "manual" && "$independent_ipv6" == "y" && "$IPV6_ENABLED" == "true" ]]; then
+        if ! podman_ipv6_address=$( /usr/local/bin/podman-ipv6-attach.sh "$name" 2>/dev/null ); then
+            podman rm -f "$name" >/dev/null 2>&1 || true
+            _red "Failed to attach a routed IPv6 address to ${name}"
+            exit 1
+        fi
+        podman_ipv6_address=$(printf '%s\n' "$podman_ipv6_address" | awk 'NF {print $NF; exit}')
+        [[ -n "$podman_ipv6_address" ]] || {
+            podman rm -f "$name" >/dev/null 2>&1 || true
+            _red "The Podman IPv6 attach helper returned no address for ${name}"
+            exit 1
+        }
+    fi
+
     _green "Container ${name} created successfully"
     sleep 3
 
@@ -741,9 +767,9 @@ main() {
     printf "%s\n" "$record"
 
     # 查询容器实际获得的 IPv6 地址（仅 IPv6 模式）
-    local container_ipv6=""
+    local container_ipv6="${podman_ipv6_address:-}"
     if [[ "$independent_ipv6" == "y" ]] && [[ "$IPV6_ENABLED" == "true" ]]; then
-        container_ipv6=$(podman inspect -f \
+        [[ -n "$container_ipv6" ]] || container_ipv6=$(podman inspect -f \
             '{{range .NetworkSettings.Networks}}{{if .GlobalIPv6Address}}{{.GlobalIPv6Address}}{{"\n"}}{{end}}{{end}}' \
             "${name}" 2>/dev/null | awk 'NF {print; exit}' || true)
         [[ -z "$container_ipv6" ]] && container_ipv6=$(podman inspect -f \

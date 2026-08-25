@@ -1,7 +1,7 @@
 #!/bin/bash
 # from
 # https://github.com/oneclickvirt/podman
-# 2026.03.01
+# 2026.08.26
 _red()    { echo -e "\033[31m\033[01m$*\033[0m"; }
 _green()  { echo -e "\033[32m\033[01m$*\033[0m"; }
 _yellow() { echo -e "\033[33m\033[01m$*\033[0m"; }
@@ -14,6 +14,10 @@ is_truthy() {
 }
 is_noninteractive() { is_truthy "${noninteractive:-${NONINTERACTIVE:-}}"; }
 python_cmd() { command -v python3 2>/dev/null || command -v python 2>/dev/null || true; }
+PODMAN_STATE_DIR="${PODMAN_STATE_DIR:-/usr/local/bin}"
+podman_state_file() {
+    printf '%s/%s\n' "${PODMAN_STATE_DIR%/}" "$1"
+}
 reading() {
     is_noninteractive && return 1
     read -rp "$(_green "$1")" "$2"
@@ -445,6 +449,40 @@ raise SystemExit(1)
 ' "$subnet"
 }
 
+# A public child of an on-link host prefix is still part of the host route,
+# even when no address has been assigned inside that child yet.  Netavark and
+# the kernel reject that topology, so inspect both addresses and connected
+# IPv6 routes before handing a subnet to a managed bridge.
+ipv6_subnet_overlaps_host() {
+    local subnet="$1"
+    local py_bin
+    py_bin=$(python_cmd)
+    [[ -n "$py_bin" ]] || return 2
+    {
+        ip -6 -o addr show 2>/dev/null | awk '$0 !~ / tentative/ {print $4}'
+        ip -6 route show table all 2>/dev/null | awk '$1 ~ /^[0-9A-Fa-f:]+\/[0-9]+$/ {print $1}'
+    } | "$py_bin" -c '
+import ipaddress
+import sys
+
+try:
+    candidate = ipaddress.IPv6Network(sys.argv[1], strict=False)
+except ValueError:
+    raise SystemExit(2)
+for raw in sys.stdin:
+    raw = raw.strip()
+    if not raw:
+        continue
+    try:
+        network = ipaddress.IPv6Network(raw, strict=False)
+    except ValueError:
+        continue
+    if candidate.overlaps(network):
+        raise SystemExit(0)
+raise SystemExit(1)
+' "$subnet"
+}
+
 check_ipv6() {
     IPV6=""
     IPV6_CIDR=""
@@ -465,12 +503,12 @@ check_ipv6() {
         _green "Locally bound public IPv6 detected: $IPV6 ($IPV6_CIDR)"
         # An egress address returned by an external service is insufficient for
         # allocating container addresses, so only retain locally bound CIDRs.
-        echo "$IPV6" > /usr/local/bin/podman_check_ipv6
-        echo "$IPV6_CIDR" > /usr/local/bin/podman_check_ipv6_cidr
+        echo "$IPV6" > "$(podman_state_file podman_check_ipv6)"
+        echo "$IPV6_CIDR" > "$(podman_state_file podman_check_ipv6_cidr)"
     else
         _yellow "No locally bound public IPv6 prefix found, skipping independent IPv6 setup"
-        echo "" > /usr/local/bin/podman_check_ipv6
-        echo "" > /usr/local/bin/podman_check_ipv6_cidr
+        echo "" > "$(podman_state_file podman_check_ipv6)"
+        echo "" > "$(podman_state_file podman_check_ipv6_cidr)"
     fi
 }
 # ======== 安装基础依赖 ========
@@ -793,7 +831,7 @@ adapt_ipv6() {
 }
 # ======== 创建 Podman IPv6 网络 ========
 set_ipv6_network_mode() {
-    printf '%s\n' "$1" > /usr/local/bin/podman_ipv6_network_mode
+    printf '%s\n' "$1" > "$(podman_state_file podman_ipv6_network_mode)"
 }
 
 ipv6_gateway_for_subnet() {
@@ -810,6 +848,54 @@ if network.num_addresses < 2:
     raise SystemExit(1)
 print(ipaddress.IPv6Address(int(network.network_address) + 1))
 PY
+}
+
+normalize_ipv6_internal_subnet() {
+    local subnet="$1"
+    local py_bin
+    py_bin=$(python_cmd)
+    [[ -n "$py_bin" ]] || return 1
+    "$py_bin" - "$subnet" <<'PY'
+import ipaddress
+import sys
+
+try:
+    network = ipaddress.IPv6Network(sys.argv[1], strict=False)
+except ValueError:
+    raise SystemExit(1)
+if network.prefixlen != 64 or not network.is_private:
+    raise SystemExit(1)
+print(network)
+PY
+}
+
+manual_ipv6_subnet_candidate() {
+    local index="$1"
+    local py_bin
+    py_bin=$(python_cmd)
+    [[ -n "$py_bin" ]] || return 1
+    "$py_bin" - "$index" <<'PY'
+import ipaddress
+import sys
+
+index = int(sys.argv[1])
+base = ipaddress.IPv6Network("fd42:5339:296f:1d00::/56")
+print(ipaddress.IPv6Network((int(base.network_address) + (index << 64), 64)))
+PY
+}
+
+choose_manual_ipv6_subnet() {
+    local candidate index
+    for index in $(seq 0 255); do
+        candidate=$(manual_ipv6_subnet_candidate "$index" 2>/dev/null || true)
+        [[ -n "$candidate" ]] || continue
+        if ipv6_subnet_overlaps_host "$candidate" || ipv6_subnet_overlaps_podman_network "$candidate"; then
+            continue
+        fi
+        printf '%s\n' "$candidate"
+        return 0
+    done
+    return 1
 }
 
 ipv6_subnet_overlaps_podman_network() {
@@ -947,7 +1033,7 @@ ensure_unmanaged_ipv6_bridge() {
     UNMANAGED_IPV6_BRIDGE_CREATED=false
 
     if ip link show podman-br1 >/dev/null 2>&1; then
-        if [[ "$(cat /usr/local/bin/podman_ipv6_bridge_owned 2>/dev/null)" != "true" ]]; then
+        if [[ "$(cat "$(podman_state_file podman_ipv6_bridge_owned)" 2>/dev/null)" != "true" ]]; then
             _yellow "podman-br1 already exists but is not owned by this installer; refusing to modify it"
             return 1
         fi
@@ -968,7 +1054,7 @@ ensure_unmanaged_ipv6_bridge() {
             _yellow "Failed to create unmanaged IPv6 bridge podman-br1"
             return 1
         fi
-        printf '%s\n' "true" > /usr/local/bin/podman_ipv6_bridge_owned
+        printf '%s\n' "true" > "$(podman_state_file podman_ipv6_bridge_owned)"
         UNMANAGED_IPV6_BRIDGE_CREATED=true
     fi
 
@@ -980,7 +1066,7 @@ ensure_unmanaged_ipv6_bridge() {
     update_sysctl "net.ipv6.conf.podman-br1.forwarding=1"
     update_sysctl "net.ipv6.conf.podman-br1.accept_ra=0"
     update_sysctl "net.ipv6.conf.podman-br1.accept_dad=0"
-    printf '%s\n' "$gateway" > /usr/local/bin/podman_ipv6_gateway
+    printf '%s\n' "$gateway" > "$(podman_state_file podman_ipv6_gateway)"
     return 0
 }
 
@@ -1041,7 +1127,7 @@ cleanup_failed_unmanaged_ipv6_bridge() {
     if [[ "$UNMANAGED_IPV6_BRIDGE_CREATED" == "true" ]]; then
         ip link set podman-br1 down 2>/dev/null || true
         ip link delete podman-br1 2>/dev/null || true
-        rm -f /usr/local/bin/podman_ipv6_bridge_owned /usr/local/bin/podman_ipv6_gateway
+        rm -f "$(podman_state_file podman_ipv6_bridge_owned)" "$(podman_state_file podman_ipv6_gateway)"
     fi
 }
 
@@ -1076,7 +1162,7 @@ create_unmanaged_ipv6_network() {
         cleanup_failed_unmanaged_ipv6_bridge
         return 1
     fi
-    printf '%s\n' "$prefix" > /usr/local/bin/podman_ipv6_subnet
+    printf '%s\n' "$prefix" > "$(podman_state_file podman_ipv6_subnet)"
     set_ipv6_network_mode unmanaged
     install_unmanaged_ipv6_bridge_service
     _green "podman-ipv6 created (unmanaged IPv6 bridge): IPv6=${prefix}; IPv4 and published ports remain on podman-net"
@@ -1113,9 +1199,325 @@ restore_unmanaged_ipv6_network_without_default_route() {
         cleanup_failed_unmanaged_ipv6_bridge
         return 1
     fi
-    printf '%s\n' "$prefix" > /usr/local/bin/podman_ipv6_subnet
+    printf '%s\n' "$prefix" > "$(podman_state_file podman_ipv6_subnet)"
     set_ipv6_network_mode unmanaged
     install_unmanaged_ipv6_bridge_service
+    return 0
+}
+
+install_manual_ipv6_attach_helper() {
+    local helper=/usr/local/bin/podman-ipv6-attach.sh
+    cat > "$helper" <<'EOF'
+#!/bin/bash
+# Installer-owned routed IPv6 attachment for Podman networks without a public IPAM subnet.
+set -u
+
+state_dir=${PODMAN_STATE_DIR:-/usr/local/bin}
+runtime=podman
+network=podman-ipv6
+parent_file="${state_dir}/podman_ipv6_public_prefix"
+subnet_file="${state_dir}/podman_ipv6_manual_subnet"
+gateway_file="${state_dir}/podman_ipv6_manual_gateway"
+bridge_file="${state_dir}/podman_ipv6_manual_bridge"
+map_file="${state_dir}/podman_ipv6_allocations"
+target_file="${state_dir}/podman_ipv6_targets"
+lock_dir="${map_file}.lock"
+
+fail() { printf '%s\n' "$*" >&2; return 1; }
+valid_name() { [[ "${1:-}" =~ ^[a-zA-Z0-9][a-zA-Z0-9_.-]*$ ]]; }
+read_state() {
+    parent=$(tr -d '[:space:]' <"$parent_file" 2>/dev/null || true)
+    subnet=$(tr -d '[:space:]' <"$subnet_file" 2>/dev/null || true)
+    gateway=$(tr -d '[:space:]' <"$gateway_file" 2>/dev/null || true)
+    bridge=$(tr -d '[:space:]' <"$bridge_file" 2>/dev/null || true)
+    [[ -n "$parent" && -n "$subnet" && -n "$gateway" && -n "$bridge" ]] || fail "Podman manual IPv6 state is incomplete"
+}
+valid_ipv6_in_parent() {
+    python3 - "$1" "$2" <<'PY'
+import ipaddress
+import sys
+try:
+    address = ipaddress.IPv6Address(sys.argv[1])
+    parent = ipaddress.IPv6Network(sys.argv[2], strict=False)
+except ValueError:
+    raise SystemExit(1)
+raise SystemExit(0 if address in parent and not address.is_unspecified and not address.is_multicast else 1)
+PY
+}
+allocate_address() {
+    python3 - "$parent" "$map_file" "$gateway" <<'PY'
+import ipaddress
+import os
+import sys
+
+parent = ipaddress.IPv6Network(sys.argv[1], strict=False)
+used = set()
+for raw in (sys.argv[2],):
+    try:
+        with open(raw, encoding="utf-8") as handle:
+            for line in handle:
+                fields = line.split()
+                if len(fields) >= 2:
+                    used.add(ipaddress.IPv6Address(fields[1]))
+    except OSError:
+        pass
+try:
+    used.add(ipaddress.IPv6Address(sys.argv[3]))
+except ValueError:
+    pass
+try:
+    output = os.popen("ip -6 -o addr show 2>/dev/null").read()
+    for line in output.splitlines():
+        fields = line.split()
+        if len(fields) >= 4:
+            try:
+                address = ipaddress.IPv6Interface(fields[3]).ip
+            except ValueError:
+                continue
+            if address in parent:
+                used.add(address)
+except OSError:
+    pass
+start = int(parent.network_address) + (0x1000 if parent.prefixlen <= 112 else 1)
+limit = min(int(parent.broadcast_address), start + 1_000_000)
+for value in range(start, limit + 1):
+    candidate = ipaddress.IPv6Address(value)
+    if candidate not in used and candidate != parent.network_address:
+        print(candidate)
+        raise SystemExit(0)
+raise SystemExit(1)
+PY
+}
+replace_mapping() {
+    local name="$1" address="$2" tmp
+    tmp=$(mktemp "${map_file}.tmp.XXXXXX") || return 1
+    awk -v name="$name" '$1 != name {print}' "$map_file" 2>/dev/null >"$tmp" || true
+    printf '%s %s\n' "$name" "$address" >>"$tmp"
+    chmod 600 "$tmp"
+    mv -f "$tmp" "$map_file" || return 1
+    sync_targets
+}
+sync_targets() {
+    local tmp rc
+    tmp=$(mktemp "${target_file}.tmp.XXXXXX") || return 1
+    awk 'NF >= 2 {print $2 "/128"}' "$map_file" | sort -u >"$tmp"
+    chmod 644 "$tmp"
+    # ndpresponder consumes this through a file bind mount. Replacing the
+    # path would leave the container attached to the old inode, so update the
+    # existing file in place after the complete replacement was prepared.
+    if cat "$tmp" >"$target_file"; then
+        rm -f "$tmp"
+        return 0
+    else
+        rc=$?
+        rm -f "$tmp"
+        return "$rc"
+    fi
+}
+acquire_lock() {
+    local attempt
+    for attempt in 1 2 3 4 5 6 7 8 9 10; do
+        mkdir "$lock_dir" 2>/dev/null && return 0
+        sleep 0.1
+    done
+    printf 'Timed out waiting for the Podman IPv6 allocation lock\n' >&2
+    return 1
+}
+release_lock() {
+    rmdir "$lock_dir" 2>/dev/null || true
+}
+find_container_iface() {
+    local name="$1" pid="$2" ula iface
+    ula=$($runtime inspect -f '{{range .NetworkSettings.Networks}}{{.GlobalIPv6Address}}{{"\n"}}{{end}}' "$name" 2>/dev/null | awk '/:/{print; exit}' || true)
+    if [[ -n "$ula" ]]; then
+        iface=$(nsenter -t "$pid" -n ip -o -6 addr show 2>/dev/null | awk -v target="$ula" '$4 ~ ("^" target "/") {print $2; exit}' || true)
+        [[ -n "$iface" ]] && { printf '%s\n' "$iface"; return 0; }
+    fi
+    nsenter -t "$pid" -n ip -o link show 2>/dev/null | awk -F': ' '$2 !~ /^lo(@|:|$)/ {gsub(/@.*/, "", $2); iface=$2} END {if (iface != "") print iface}'
+}
+attach_one_locked() {
+    local name="$1" requested="${2:-}" pid address iface
+    pid=$($runtime inspect -f '{{.State.Pid}}' "$name" 2>/dev/null || true)
+    [[ "$pid" =~ ^[1-9][0-9]*$ ]] || return 1
+    address=$(awk -v name="$name" '$1 == name {print $2; exit}' "$map_file" 2>/dev/null || true)
+    if [[ -n "$requested" ]]; then
+        valid_ipv6_in_parent "$requested" "$parent" || { printf 'Requested IPv6 is outside the routed parent: %s\n' "$requested" >&2; return 1; }
+        address="$requested"
+    fi
+    [[ -n "$address" ]] || address=$(allocate_address) || return 1
+    valid_ipv6_in_parent "$address" "$parent" || return 1
+    iface=$(find_container_iface "$name" "$pid")
+    [[ -n "$iface" ]] || { printf 'Unable to find the IPv6 network interface for %s\n' "$name" >&2; return 1; }
+    nsenter -t "$pid" -n ip link set "$iface" up || return 1
+    nsenter -t "$pid" -n ip -6 addr replace "$address/128" dev "$iface" || return 1
+    nsenter -t "$pid" -n ip -6 route replace default via "$gateway" dev "$iface" || return 1
+    ip -6 route replace "$address/128" dev "$bridge" || return 1
+    replace_mapping "$name" "$address" || return 1
+    printf '%s\n' "$address"
+}
+attach_one() {
+    local name="$1" requested="${2:-}" rc
+    valid_name "$name" || return 1
+    read_state || return 1
+    [[ -f "$map_file" ]] || : >"$map_file"
+    [[ -f "$target_file" ]] || : >"$target_file"
+    acquire_lock || return 1
+    attach_one_locked "$name" "$requested"
+    rc=$?
+    release_lock
+    return "$rc"
+}
+prune_stale_mappings_locked() {
+    local name address tmp changed=false
+    [[ -f "$map_file" ]] || return 0
+    tmp=$(mktemp "${map_file}.tmp.XXXXXX") || return 1
+    while read -r name address; do
+        [[ -n "$name" && -n "$address" ]] || continue
+        if valid_name "$name" && valid_ipv6_in_parent "$address" "$parent" && \
+           "$runtime" inspect "$name" >/dev/null 2>&1; then
+            printf '%s %s\n' "$name" "$address" >>"$tmp"
+            continue
+        fi
+        changed=true
+        if valid_ipv6_in_parent "$address" "$parent"; then
+            ip -6 route del "${address}/128" dev "$bridge" 2>/dev/null || true
+        fi
+    done <"$map_file"
+    if [[ "$changed" == true ]]; then
+        chmod 600 "$tmp"
+        mv -f "$tmp" "$map_file" || return 1
+        sync_targets
+        return $?
+    fi
+    rm -f "$tmp"
+    return 0
+}
+restore_all() {
+    local name address rc=0
+    read_state || return 1
+    [[ -f "$map_file" ]] || return 0
+    [[ -f "$target_file" ]] || : >"$target_file"
+    acquire_lock || return 1
+    prune_stale_mappings_locked || rc=1
+    while read -r name address; do
+        [[ -n "$name" && -n "$address" ]] || continue
+        [[ "$($runtime inspect -f '{{.State.Running}}' "$name" 2>/dev/null || true)" == true ]] || continue
+        attach_one_locked "$name" "$address" >/dev/null || {
+            printf 'Failed to restore IPv6 for %s\n' "$name" >&2
+            rc=1
+        }
+    done <"$map_file"
+    release_lock
+    return "$rc"
+}
+
+watch_all() {
+    local interval="${PODMAN_IPV6_WATCH_INTERVAL:-2}"
+    [[ "$interval" =~ ^[1-9][0-9]*$ ]] || interval=2
+    while :; do
+        restore_all || true
+        sleep "$interval"
+    done
+}
+remove_one_locked() {
+    local name="$1" old_address tmp
+    old_address=$(awk -v name="$name" '$1 == name {print $2; exit}' "$map_file" 2>/dev/null || true)
+    tmp=$(mktemp "${map_file}.tmp.XXXXXX") || return 1
+    awk -v name="$name" '$1 != name {print}' "$map_file" 2>/dev/null >"$tmp" || true
+    chmod 600 "$tmp"
+    mv -f "$tmp" "$map_file" || return 1
+    sync_targets || return 1
+    if [[ -n "$old_address" ]]; then
+        ip -6 route del "${old_address}/128" dev "$bridge" 2>/dev/null || true
+    fi
+}
+remove_one() {
+    local name="$1" rc
+    valid_name "$name" || return 1
+    read_state || return 1
+    [[ -f "$map_file" ]] || : >"$map_file"
+    [[ -f "$target_file" ]] || : >"$target_file"
+    acquire_lock || return 1
+    remove_one_locked "$name"
+    rc=$?
+    release_lock
+    return "$rc"
+}
+
+case "${1:-}" in
+    --restore-all) restore_all ;;
+    --watch) watch_all ;;
+    --remove)
+        name="${2:-}"
+        remove_one "$name"
+        ;;
+    *)
+        [[ -n "${1:-}" ]] || { printf 'usage: %s <container> [IPv6] | --restore-all | --watch | --remove <container>\n' "$0" >&2; exit 2; }
+        attach_one "$@"
+        ;;
+esac
+EOF
+    chmod 700 "$helper"
+    mkdir -p "$PODMAN_STATE_DIR"
+    [[ -f "$(podman_state_file podman_ipv6_allocations)" ]] || : > "$(podman_state_file podman_ipv6_allocations)"
+    [[ -f "$(podman_state_file podman_ipv6_targets)" ]] || : > "$(podman_state_file podman_ipv6_targets)"
+    chmod 600 "$(podman_state_file podman_ipv6_allocations)"
+    chmod 644 "$(podman_state_file podman_ipv6_targets)"
+}
+
+install_manual_ipv6_restore_service() {
+    command -v systemctl >/dev/null 2>&1 || return 0
+    cat > /etc/systemd/system/podman-ipv6-attach.service <<'EOF'
+[Unit]
+Description=Restore OneClickVirt Podman routed IPv6 addresses
+After=network-online.target podman-restart.service
+Wants=network-online.target
+
+[Service]
+Type=simple
+ExecStart=/usr/local/bin/podman-ipv6-attach.sh --watch
+Restart=always
+RestartSec=2
+
+[Install]
+WantedBy=multi-user.target
+EOF
+    systemctl daemon-reload 2>/dev/null || true
+    systemctl enable --now podman-ipv6-attach.service 2>/dev/null || \
+        _yellow "Could not start podman-ipv6-attach.service; routed IPv6 must be reattached manually after container restarts"
+}
+
+create_manual_ipv6_network() {
+    local public_prefix="$1" net_err="$2" manual_subnet gateway bridge
+    public_prefix=$(normalize_ipv6_subnet "$public_prefix" 2>/dev/null || true)
+    [[ -n "$public_prefix" ]] || return 1
+    manual_subnet=$(choose_manual_ipv6_subnet 2>/dev/null || true)
+    [[ -n "$manual_subnet" ]] || { _yellow "Could not find a free ULA subnet for the Podman IPv6 bridge"; return 1; }
+    gateway=$(ipv6_gateway_for_subnet "$manual_subnet" 2>/dev/null || true)
+    [[ -n "$gateway" ]] || return 1
+    bridge=podman-br1
+    if ! podman network create --driver bridge --ipv6 --disable-dns \
+        --interface-name "$bridge" --subnet 172.21.0.0/16 --gateway 172.21.0.1 \
+        --subnet "$manual_subnet" --gateway "$gateway" podman-ipv6 2>"$net_err"; then
+        if ! grep -qiE 'unknown (option|flag).*interface-name|unrecognized option.*interface-name' "$net_err" || \
+           ! podman network create --driver bridge --ipv6 --disable-dns \
+             --subnet 172.21.0.0/16 --gateway 172.21.0.1 --subnet "$manual_subnet" \
+             --gateway "$gateway" podman-ipv6 2>"$net_err"; then
+            _yellow "Manual IPv6 network creation failed: $(cat "$net_err" 2>/dev/null)"
+            return 1
+        fi
+        bridge=$(podman network inspect -f '{{.NetworkInterface}}' podman-ipv6 2>/dev/null || true)
+        [[ -n "$bridge" && "$bridge" != '<no value>' ]] || bridge=podman-br1
+    fi
+    printf '%s\n' "$public_prefix" > "$(podman_state_file podman_ipv6_public_prefix)"
+    printf '%s\n' "$manual_subnet" > "$(podman_state_file podman_ipv6_manual_subnet)"
+    printf '%s\n' "$gateway" > "$(podman_state_file podman_ipv6_manual_gateway)"
+    printf '%s\n' "$bridge" > "$(podman_state_file podman_ipv6_manual_bridge)"
+    printf '%s\n' manual > "$(podman_state_file podman_ipv6_network_mode)"
+    install_manual_ipv6_attach_helper
+    install_manual_ipv6_restore_service
+    _green "podman-ipv6 created (manual routed IPv6): internal=${manual_subnet}, public parent=${public_prefix}"
+    _yellow "Public IPv6 addresses will be assigned as /128 routes after each container starts"
     return 0
 }
 
@@ -1127,7 +1529,7 @@ migrate_unmanaged_ipv6_network_default_route() {
         _yellow "Preserving the network. Stop/remove every container attached to podman-ipv6, then rerun this installer to migrate it safely"
         return 1
     fi
-    if [[ "$(cat /usr/local/bin/podman_ipv6_bridge_owned 2>/dev/null)" != "true" ]]; then
+    if [[ "$(cat "$(podman_state_file podman_ipv6_bridge_owned)" 2>/dev/null)" != "true" ]]; then
         _yellow "Existing unmanaged podman-ipv6 network lacks an explicit IPv6 default route and podman-br1 is not marked installer-owned"
         _yellow "Refusing to replace an unowned bridge. Recreate podman-ipv6 manually with --opt no_default_route=1 and --route ::/0,<gateway>"
         return 1
@@ -1176,11 +1578,17 @@ create_ipv6_network() {
     local ipv6_cidr="$1"
     local prefix net_err managed_error
     local -a prefixes=()
-    local -a unmanaged_prefixes=()
+    local manual_attempted=false
     _yellow "Creating Podman IPv6 network (podman-ipv6)..."
     if podman network exists podman-ipv6 2>/dev/null; then
         managed_error=$(podman network inspect -f '{{index .Options "mode"}}' podman-ipv6 2>/dev/null || true)
-        if [[ "$managed_error" == "unmanaged" ]]; then
+        if [[ "$managed_error" == "manual" ]] || [[ -s "$(podman_state_file podman_ipv6_public_prefix)" && -s "$(podman_state_file podman_ipv6_manual_subnet)" ]]; then
+            if [[ ! -x /usr/local/bin/podman-ipv6-attach.sh ]]; then
+                install_manual_ipv6_attach_helper
+            fi
+            install_manual_ipv6_restore_service
+            set_ipv6_network_mode manual
+        elif [[ "$managed_error" == "unmanaged" ]]; then
             if ! podman_ipv6_network_has_explicit_default_route; then
                 if migrate_unmanaged_ipv6_network_default_route; then
                     return 0
@@ -1202,8 +1610,15 @@ create_ipv6_network() {
             _yellow "PODMAN_IPV6_SUBNET must be a public IPv6 CIDR shorter than /128"
             return 1
         fi
-        if ipv6_subnet_has_live_address "$prefix"; then
-            _yellow "PODMAN_IPV6_SUBNET=${prefix} contains a host IPv6 address; choose a dedicated sibling prefix instead"
+        if ipv6_subnet_overlaps_host "$prefix"; then
+            _yellow "PODMAN_IPV6_SUBNET=${prefix} overlaps a host route; switching to routed manual IPv6 mode"
+            net_err=$(mktemp /tmp/podman-net.XXXXXX 2>/dev/null || true)
+            [[ -n "$net_err" ]] || net_err="/tmp/podman-net.$$"
+            if create_manual_ipv6_network "$prefix" "$net_err"; then
+                rm -f "$net_err" 2>/dev/null || true
+                return 0
+            fi
+            rm -f "$net_err" 2>/dev/null || true
             return 1
         fi
         prefixes=("$prefix")
@@ -1222,17 +1637,19 @@ create_ipv6_network() {
             _yellow "Skipping IPv6 subnet ${prefix}: it contains a live host address"
             continue
         fi
-        if ipv6_subnet_overlaps_live_network "$prefix"; then
-            # Netavark intentionally rejects this case.  Its documented
-            # unmanaged bridge mode is safe here because the script owns a
-            # more-specific bridge route and keeps the host address excluded.
-            unmanaged_prefixes+=("$prefix")
+        if ipv6_subnet_overlaps_host "$prefix"; then
             _yellow "IPv6 subnet ${prefix} overlaps a host CIDR; managed Netavark bridge would reject it"
+            if [[ "$manual_attempted" == false ]] && create_manual_ipv6_network "$ipv6_cidr" "$net_err"; then
+                manual_attempted=true
+                rm -f "$net_err" 2>/dev/null || true
+                return 0
+            fi
+            manual_attempted=true
             continue
         fi
         _yellow "Trying managed IPv6 subnet for podman-ipv6: ${prefix}"
         if create_managed_ipv6_network "$prefix" "$net_err"; then
-            printf '%s\n' "$prefix" > /usr/local/bin/podman_ipv6_subnet
+            printf '%s\n' "$prefix" > "$(podman_state_file podman_ipv6_subnet)"
             set_ipv6_network_mode managed
             rm -f "$net_err" 2>/dev/null || true
             return 0
@@ -1241,20 +1658,16 @@ create_ipv6_network() {
         _yellow "Managed IPv6 subnet ${prefix} failed: ${managed_error}"
     done
 
-    # A sibling can legitimately collide with an unrelated existing Podman
-    # network. Try every host-route-overlapping sibling instead of giving up
-    # after the first collision.
-    for prefix in "${unmanaged_prefixes[@]}"; do
-        if ipv6_subnet_overlaps_podman_network "$prefix"; then
-            _yellow "IPv6 subnet ${prefix} overlaps an existing Podman network; skipping unmanaged fallback"
-        elif create_unmanaged_ipv6_network "$prefix" "$net_err"; then
-            rm -f "$net_err" 2>/dev/null || true
-            return 0
-        fi
-    done
+    # A public subnet that belongs to the host's on-link SLAAC prefix cannot be
+    # passed to Netavark, even when the specific host address is unused. Use the
+    # manual routed bridge so the runtime only sees an isolated ULA network.
+    if [[ "$manual_attempted" == false ]] && create_manual_ipv6_network "$ipv6_cidr" "$net_err"; then
+        rm -f "$net_err" 2>/dev/null || true
+        return 0
+    fi
 
     _yellow "Warning: podman-ipv6 creation failed; independent IPv6 remains disabled"
-    printf '%s\n' "" > /usr/local/bin/podman_ipv6_subnet
+    printf '%s\n' "" > "$(podman_state_file podman_ipv6_subnet)"
     set_ipv6_network_mode ""
     rm -f "$net_err" 2>/dev/null || true
     return 1
@@ -1343,8 +1756,8 @@ resolve_ndpresponder_image() {
 
 start_ndpresponder() {
     _yellow "Starting NDP responder for IPv6..."
-    local podman_socket ndp_status ndp_logs ndp_image
-    local -a ndp_args
+    local podman_socket ndp_status ndp_logs ndp_image ndp_target_file
+    local -a ndp_args ndp_volume_args
     if ! podman network exists podman-ipv6 2>/dev/null; then
         _yellow "podman-ipv6 network not found, skipping ndpresponder"
         return 1
@@ -1362,7 +1775,16 @@ start_ndpresponder() {
     fi
     ndp_image="$NDPRESPONDER_IMAGE"
     podman rm -f ndpresponder 2>/dev/null || true
-    ndp_args=(-N podman-ipv6)
+    ndp_target_file=""
+    if [[ "$(cat "$(podman_state_file podman_ipv6_network_mode)" 2>/dev/null || true)" == "manual" ]]; then
+        ndp_target_file=$(podman_state_file podman_ipv6_targets)
+        [[ -f "$ndp_target_file" ]] || : > "$ndp_target_file"
+        ndp_args=(--target-file /etc/ndpresponder-targets)
+        ndp_volume_args=(--volume "${ndp_target_file}:/etc/ndpresponder-targets:ro")
+    else
+        ndp_args=(-N podman-ipv6)
+        ndp_volume_args=()
+    fi
     if [[ -n "$interface" ]]; then
         ndp_args=(-i "$interface" "${ndp_args[@]}")
     fi
@@ -1375,6 +1797,7 @@ start_ndpresponder() {
         --cap-add=NET_ADMIN \
         --network host \
         --volume "${podman_socket}:/var/run/docker.sock:ro" \
+        "${ndp_volume_args[@]}" \
         -e DOCKER_HOST=unix:///var/run/docker.sock \
         --name ndpresponder \
         "${ndp_image}" \
@@ -1477,7 +1900,7 @@ verify_install() {
     if podman network exists podman-net 2>/dev/null; then
         _green "  ✓ podman-net network exists"
     fi
-    if [[ "$(cat /usr/local/bin/podman_ipv6_enabled 2>/dev/null)" == "true" ]]; then
+    if [[ "$(cat "$(podman_state_file podman_ipv6_enabled)" 2>/dev/null)" == "true" ]]; then
         if podman network exists podman-ipv6 2>/dev/null; then
             _green "  ✓ podman-ipv6 network exists"
         fi
@@ -1488,7 +1911,7 @@ main() {
     _blue "======================================================"
     _blue "  Podman 容器运行时一键安装脚本"
     _blue "  from https://github.com/oneclickvirt/podman"
-    _blue "  2026.03.01"
+    _blue "  2026.08.26"
     _blue "======================================================"
     echo
     # 重新计算 int（系统类型索引）
@@ -1606,12 +2029,12 @@ main() {
     if [[ "$IPV6_ENABLED" == true ]]; then
         adapt_ipv6
         if create_ipv6_network "$IPV6_CIDR" && start_ndpresponder; then
-            echo "true" > /usr/local/bin/podman_ipv6_enabled
+            echo "true" > "$(podman_state_file podman_ipv6_enabled)"
         else
-            echo "false" > /usr/local/bin/podman_ipv6_enabled
+            echo "false" > "$(podman_state_file podman_ipv6_enabled)"
         fi
     else
-        echo "false" > /usr/local/bin/podman_ipv6_enabled
+        echo "false" > "$(podman_state_file podman_ipv6_enabled)"
     fi
     # 保存架构信息
     echo "$ARCH_TYPE" > /usr/local/bin/podman_arch

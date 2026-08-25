@@ -21,12 +21,20 @@ python_cmd() {
     command -v python3
 }
 
+PODMAN_STATE_DIR=$(mktemp -d "${TMPDIR:-/tmp}/podman-ipv6-state.XXXXXX")
+trap 'rm -rf -- "$PODMAN_STATE_DIR"' EXIT
+
+# shellcheck disable=SC1090 # The test intentionally loads one installer helper.
+source <(extract_function podman_state_file)
+
 # shellcheck disable=SC1090 # The test intentionally loads one installer function.
 source <(extract_function generate_ipv6_subnet_candidates)
 # shellcheck disable=SC1090 # The test intentionally loads one installer function.
 source <(extract_function is_public_ipv6)
 # shellcheck disable=SC1090 # The test intentionally loads one installer function.
 source <(extract_function normalize_ipv6_subnet)
+# shellcheck disable=SC1090 # The test intentionally loads the host-route guard.
+source <(extract_function ipv6_subnet_overlaps_host)
 # shellcheck disable=SC1090 # The test intentionally loads one installer function.
 source <(extract_function create_ipv6_network)
 # shellcheck disable=SC1090 # The test intentionally loads one installer helper.
@@ -35,6 +43,28 @@ source <(extract_function ndpresponder_image_matches_architecture)
 source <(extract_function podman_ipv6_network_has_explicit_default_route)
 
 host_cidr="2a14:6781:000a:0000:0009:0000:0000:0000/64"
+
+ip() {
+    if [[ "$1" == "-6" && "$2" == "-o" && "$3" == "addr" ]]; then
+        printf '%s\n' '2: eth0 inet6 2605:52c0:2:14b:be24:11ff:fe6e:d967/64 scope global'
+    elif [[ "$1" == "-6" && "$2" == "route" ]]; then
+        printf '%s\n' '2605:52c0:2:14b::/64 dev eth0 proto kernel'
+    fi
+}
+if ! ipv6_subnet_overlaps_host "2605:52c0:2:14b:1::/112"; then
+    printf 'host connected IPv6 route was not detected as an overlap\n' >&2
+    exit 1
+fi
+if ipv6_subnet_overlaps_host "2a14:6781:a::/112"; then
+    printf 'unrelated IPv6 route was reported as an overlap\n' >&2
+    exit 1
+fi
+unset -f ip
+
+# The migration test exercises the decision path only; network mutation is
+# stubbed so it remains safe for an unprivileged macOS/Linux test runner.
+create_manual_ipv6_network() { return 1; }
+
 candidates=()
 while IFS= read -r candidate; do
     [[ -n "$candidate" ]] && candidates+=("$candidate")
@@ -146,6 +176,7 @@ cat() {
     fi
     command cat "$@"
 }
+printf '%s\n' true >"$(podman_state_file podman_ipv6_bridge_owned)"
 migrated_prefix=""
 # shellcheck disable=SC2329 # Invoked by the dynamically sourced installer helper.
 podman() {
@@ -331,7 +362,8 @@ unset NDPRESPONDER_SOURCE_URL
 # the first sibling is already used by another Podman network, it must keep
 # trying later siblings.
 _yellow() { :; }
-captured_unmanaged_prefix=""
+captured_manual_parent=""
+manual_fallback_called=false
 managed_attempted=false
 # shellcheck disable=SC2329 # Invoked by the dynamically loaded installer function.
 podman() {
@@ -344,7 +376,7 @@ generate_ipv6_subnet_candidates() {
     printf '%s\n' '2a14:6781:a:0:2::/96'
 }
 ipv6_subnet_has_live_address() { return 1; }
-ipv6_subnet_overlaps_live_network() { return 0; }
+ipv6_subnet_overlaps_host() { return 0; }
 ipv6_subnet_overlaps_podman_network() {
     [[ "$1" == '2a14:6781:a:0:1::/96' ]]
 }
@@ -352,28 +384,26 @@ create_managed_ipv6_network() {
     managed_attempted=true
     return 1
 }
-create_unmanaged_ipv6_network() {
-    captured_unmanaged_prefix="$1"
+create_manual_ipv6_network() {
+    captured_manual_parent="$1"
+    manual_fallback_called=true
     return 0
 }
 set_ipv6_network_mode() { :; }
 unset PODMAN_IPV6_SUBNET
 create_ipv6_network "$host_cidr"
-[[ "$captured_unmanaged_prefix" == '2a14:6781:a:0:2::/96' ]] || {
-    printf 'expected unmanaged fallback subnet, got %q\n' "$captured_unmanaged_prefix" >&2
+[[ "$captured_manual_parent" == "$host_cidr" ]] || {
+    printf 'expected manual fallback to retain the public parent, got %q\n' "$captured_manual_parent" >&2
     exit 1
 }
 [[ "$managed_attempted" == false ]] || {
     printf 'managed network creation was attempted despite host-route overlap\n' >&2
     exit 1
 }
-# shellcheck disable=SC2016 # Literal expression must match the installer source.
-for required_option in '--opt mode=unmanaged' '--opt no_default_route=1' '--route "::/0,${gateway}"'; do
-    if ! extract_function create_unmanaged_ipv6_network | grep -Fq -- "$required_option"; then
-        printf 'unmanaged fallback is missing required Netavark option: %s\n' "$required_option" >&2
-        exit 1
-    fi
-done
+[[ "$manual_fallback_called" == true ]] || {
+    printf 'manual routed fallback was not attempted\n' >&2
+    exit 1
+}
 if ! grep -Fq 'net_opts="--network podman-net --network podman-ipv6"' "$repo_root/scripts/onepodman.sh"; then
     printf 'unmanaged IPv6 containers must attach podman-net before podman-ipv6\n' >&2
     exit 1
