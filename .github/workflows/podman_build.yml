@@ -48,7 +48,10 @@ jobs:
           sudo apt-get update -y
           sudo apt-get install -y --no-install-recommends shellcheck
           bash -n podmaninstall.sh scripts/onepodman.sh
-          shellcheck tests/test_ipv6_network.sh
+          # This test dynamically sources installer helpers and replaces
+          # external commands with function mocks, which ShellCheck cannot
+          # statically trace on the Ubuntu runner.
+          shellcheck -e SC2317 tests/test_ipv6_network.sh
           bash tests/test_ipv6_network.sh
 
   build:
