@@ -195,6 +195,10 @@ if normalize_ipv6_subnet "ff02::/64" >/dev/null; then
     printf 'multicast IPv6 subnet was accepted for Podman\n' >&2
     exit 1
 fi
+if [[ "$(normalize_ipv6_subnet '2a14:7c0:1002:10f8::1/38')" != '2a14:7c0:1000::/38' ]]; then
+    printf 'non-byte-aligned delegated /38 was not normalized for Podman\n' >&2
+    exit 1
+fi
 
 if extract_function check_ipv6 | grep -Eq 'API_NET|curl[[:space:]]'; then
     printf 'check_ipv6 must not use an external address as a subnet source\n' >&2
@@ -554,10 +558,9 @@ fi
 unset NDPRESPONDER_SOURCE_URL
 
 # A sibling of a host-assigned prefix overlaps the host route, which Netavark
-# rejects in managed mode. The installer must choose its owned unmanaged
-# bridge fallback instead of retrying the unsafe host-containing subnet. If
-# the first sibling is already used by another Podman network, it must keep
-# trying later siblings.
+# rejects in managed mode. The installer must choose the manual routed IPv6
+# fallback instead of retrying the unsafe host-containing subnet. That keeps
+# Netavark on an isolated ULA bridge while public /128 routes remain usable.
 _yellow() { :; }
 captured_manual_parent=""
 manual_fallback_called=false
@@ -599,6 +602,23 @@ create_ipv6_network "$host_cidr"
 }
 [[ "$manual_fallback_called" == true ]] || {
     printf 'manual routed fallback was not attempted\n' >&2
+    exit 1
+}
+
+# A delegated prefix can be shorter than /64 (for example, PVE commonly has
+# a routed /38 bridge beside a primary /128). Preserve that parent exactly so
+# the manual /128 allocator can use the full delegated range.
+delegated_cidr='2a14:7c0:1002:10f8::1/38'
+captured_manual_parent=''
+manual_fallback_called=false
+managed_attempted=false
+create_ipv6_network "$delegated_cidr"
+[[ "$captured_manual_parent" == "$delegated_cidr" ]] || {
+    printf 'delegated /38 manual fallback changed the routed parent: %q\n' "$captured_manual_parent" >&2
+    exit 1
+}
+[[ "$managed_attempted" == false && "$manual_fallback_called" == true ]] || {
+    printf 'delegated /38 attempted managed Podman IPv6 instead of manual routing\n' >&2
     exit 1
 }
 if ! grep -Fq 'net_opts="--network podman-net --network podman-ipv6"' "$repo_root/scripts/onepodman.sh"; then
