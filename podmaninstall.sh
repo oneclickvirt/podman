@@ -1695,6 +1695,56 @@ ndpresponder_image_matches_architecture() {
     return 1
 }
 
+ndpresponder_supports_target_file() {
+    local image="$1" help_output
+    # The published tag can lag the source repository. Probe the actual image
+    # before mounting a target file; an older binary must never be put into a
+    # restart loop with a flag it does not understand.
+    help_output=$(podman run --rm "$image" --help 2>&1 || true)
+    grep -Eq -- '(^|[[:space:],])--target-file([[:space:],=]|$)' <<<"$help_output"
+}
+
+ndpresponder_image_supports_required_features() {
+    if [[ "${NDPRESPONDER_TARGET_FILE_REQUIRED:-false}" != true ]]; then
+        return 0
+    fi
+    if ndpresponder_supports_target_file "$1"; then
+        return 0
+    fi
+    _yellow "Responder image does not support --target-file; a source build is required for manual routed IPv6"
+    _yellow "ndpresponder 镜像不支持 --target-file；手动路由 IPv6 需要从源码构建新版程序"
+    return 1
+}
+
+ndpresponder_existing_container_image() {
+    local image
+    podman inspect ndpresponder >/dev/null 2>&1 || return 1
+    image=$(podman inspect -f '{{.ImageName}}' ndpresponder 2>/dev/null || true)
+    if [[ -z "$image" || "$image" == '<no value>' ]]; then
+        image=$(podman inspect -f '{{.Image}}' ndpresponder 2>/dev/null || true)
+    fi
+    [[ -n "$image" && "$image" != '<no value>' ]] || return 1
+    printf '%s\n' "$image"
+}
+
+quarantine_incompatible_manual_ndpresponder() {
+    local existing_image
+    [[ "${NDPRESPONDER_TARGET_FILE_REQUIRED:-false}" == true ]] || return 0
+    existing_image=$(ndpresponder_existing_container_image 2>/dev/null || true)
+    [[ -n "$existing_image" ]] || return 0
+    if ndpresponder_supports_target_file "$existing_image"; then
+        return 0
+    fi
+
+    _yellow "Existing ndpresponder cannot read --target-file; removing it to stop an incompatible restart loop"
+    _yellow "现有 ndpresponder 不支持 --target-file，正在移除以停止不兼容的重启循环"
+    # Updating the policy before removal handles older containers that were
+    # created with --restart always and may otherwise keep consuming CPU while
+    # a source-build fallback is unavailable.
+    podman update --restart=no ndpresponder >/dev/null 2>&1 || true
+    podman rm -f ndpresponder >/dev/null 2>&1 || true
+}
+
 resolve_ndpresponder_image() {
     local arch_tag="" registry_image="" image_arch source_image source_url
     NDPRESPONDER_IMAGE=""
@@ -1724,7 +1774,8 @@ resolve_ndpresponder_image() {
 
         if [[ -n "$registry_image" ]]; then
             image_arch=$(podman image inspect --format '{{.Architecture}}' "$registry_image" 2>/dev/null || true)
-            if ndpresponder_image_matches_architecture "$ARCH_TYPE" "$image_arch"; then
+            if ndpresponder_image_matches_architecture "$ARCH_TYPE" "$image_arch" && \
+               ndpresponder_image_supports_required_features "$registry_image"; then
                 NDPRESPONDER_IMAGE="$registry_image"
                 return 0
             fi
@@ -1750,13 +1801,18 @@ resolve_ndpresponder_image() {
         _yellow "Locally built responder image ${source_image} is ${image_arch:-unknown}, expected ${ARCH_TYPE}; preserving any existing responder"
         return 1
     fi
+    if ! ndpresponder_image_supports_required_features "$source_image"; then
+        _yellow "The source-built responder is missing the required target-file capability; preserving any existing responder"
+        _yellow "源码构建的 ndpresponder 缺少所需的 target-file 能力，将保留现有 responder"
+        return 1
+    fi
     NDPRESPONDER_IMAGE="$source_image"
     return 0
 }
 
 start_ndpresponder() {
     _yellow "Starting NDP responder for IPv6..."
-    local podman_socket ndp_status ndp_logs ndp_image ndp_target_file
+    local podman_socket ndp_status ndp_logs ndp_image ndp_target_file network_mode
     local -a ndp_args ndp_volume_args
     if ! podman network exists podman-ipv6 2>/dev/null; then
         _yellow "podman-ipv6 network not found, skipping ndpresponder"
@@ -1770,13 +1826,20 @@ start_ndpresponder() {
         _yellow "Podman API socket not found; ndpresponder cannot track container IPv6 addresses"
         return 1
     fi
+    network_mode=$(cat "$(podman_state_file podman_ipv6_network_mode)" 2>/dev/null || true)
+    if [[ "$network_mode" == "manual" ]]; then
+        NDPRESPONDER_TARGET_FILE_REQUIRED=true
+    else
+        NDPRESPONDER_TARGET_FILE_REQUIRED=false
+    fi
+    quarantine_incompatible_manual_ndpresponder
     if ! resolve_ndpresponder_image; then
         return 1
     fi
     ndp_image="$NDPRESPONDER_IMAGE"
     podman rm -f ndpresponder 2>/dev/null || true
     ndp_target_file=""
-    if [[ "$(cat "$(podman_state_file podman_ipv6_network_mode)" 2>/dev/null || true)" == "manual" ]]; then
+    if [[ "$network_mode" == "manual" ]]; then
         ndp_target_file=$(podman_state_file podman_ipv6_targets)
         [[ -f "$ndp_target_file" ]] || : > "$ndp_target_file"
         ndp_args=(--target-file /etc/ndpresponder-targets)
@@ -1789,7 +1852,7 @@ start_ndpresponder() {
         ndp_args=(-i "$interface" "${ndp_args[@]}")
     fi
     if podman run -d \
-        --restart always \
+        --restart on-failure:3 \
         --cpus 0.02 \
         --memory 64m \
         --cap-drop=ALL \
@@ -1818,6 +1881,9 @@ start_ndpresponder() {
     else
         _yellow "ndpresponder start failed; IPv6 may require manual NDP configuration"
     fi
+    # Do not leave a failed responder with an unconditional restart policy.
+    # The old container would otherwise spin forever on an unsupported flag.
+    podman rm -f ndpresponder 2>/dev/null || true
     return 1
 }
 # ======== 配置 podman.socket 服务（可选，供 API 使用） ========
@@ -1833,8 +1899,8 @@ setup_podman_socket() {
     fi
     if ! systemd_unit_exists podman-restart.service; then
         printf '%s\n' "[Unit]" "Description=OneClickVirt Podman Restart Policy Containers" "Documentation=https://github.com/oneclickvirt/podman" "After=network-online.target" "Wants=network-online.target" "[Service]" "Type=oneshot" "RemainAfterExit=yes" \
-            "ExecStart=/bin/sh -c 'podman ps -aq --filter restart-policy=always 2>/dev/null | while IFS= read -r id; do [ -n \"\$id\" ] && podman start \"\$id\" || true; done'" \
-            "ExecStop=/bin/sh -c 'podman ps -aq --filter restart-policy=always 2>/dev/null | while IFS= read -r id; do [ -n \"\$id\" ] && podman stop \"\$id\" || true; done'" "[Install]" "WantedBy=multi-user.target" > /etc/systemd/system/podman-restart.service
+            "ExecStart=/bin/sh -c 'for policy in always on-failure; do podman ps -aq --filter restart-policy=\"\$policy\" 2>/dev/null; done | sort -u | while IFS= read -r id; do [ -n \"\$id\" ] && podman start \"\$id\" || true; done'" \
+            "ExecStop=/bin/sh -c 'for policy in always on-failure; do podman ps -aq --filter restart-policy=\"\$policy\" 2>/dev/null; done | sort -u | while IFS= read -r id; do [ -n \"\$id\" ] && podman stop \"\$id\" || true; done'" "[Install]" "WantedBy=multi-user.target" > /etc/systemd/system/podman-restart.service
         systemctl daemon-reload 2>/dev/null || true
     fi
     if systemd_unit_exists podman-restart.service; then

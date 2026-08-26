@@ -39,11 +39,20 @@ source <(extract_function ipv6_subnet_overlaps_host)
 source <(extract_function create_ipv6_network)
 # shellcheck disable=SC1090 # The test intentionally loads one installer helper.
 source <(extract_function ndpresponder_image_matches_architecture)
+# shellcheck disable=SC1090 # The test intentionally loads one installer helper.
+source <(extract_function ndpresponder_supports_target_file)
+# shellcheck disable=SC1090 # The test intentionally loads one installer helper.
+source <(extract_function ndpresponder_image_supports_required_features)
+# shellcheck disable=SC1090 # The test intentionally loads one installer helper.
+source <(extract_function ndpresponder_existing_container_image)
+# shellcheck disable=SC1090 # The test intentionally loads one installer helper.
+source <(extract_function quarantine_incompatible_manual_ndpresponder)
 # shellcheck disable=SC1090 # The test intentionally loads the route-health helper.
 source <(extract_function podman_ipv6_network_has_explicit_default_route)
 
 host_cidr="2a14:6781:000a:0000:0009:0000:0000:0000/64"
 
+# shellcheck disable=SC2329 # Invoked by the dynamically sourced IPv6 helper.
 ip() {
     if [[ "$1" == "-6" && "$2" == "-o" && "$3" == "addr" ]]; then
         printf '%s\n' '2: eth0 inet6 2605:52c0:2:14b:be24:11ff:fe6e:d967/64 scope global'
@@ -63,6 +72,7 @@ unset -f ip
 
 # The migration test exercises the decision path only; network mutation is
 # stubbed so it remains safe for an unprivileged macOS/Linux test runner.
+# shellcheck disable=SC2329 # Invoked by the dynamically sourced network creator.
 create_manual_ipv6_network() { return 1; }
 
 candidates=()
@@ -108,7 +118,7 @@ if extract_function check_ipv6 | grep -Eq 'API_NET|curl[[:space:]]'; then
     printf 'check_ipv6 must not use an external address as a subnet source\n' >&2
     exit 1
 fi
-if ! extract_function adapt_ipv6 | grep -Fq 'net.ipv6.conf.${interface}.accept_ra=2'; then
+if ! extract_function adapt_ipv6 | grep -Fq "net.ipv6.conf.\${interface}.accept_ra=2"; then
     printf 'Podman IPv6 forwarding must preserve router advertisements on the uplink\n' >&2
     exit 1
 fi
@@ -118,6 +128,85 @@ if ! ndpresponder_image_matches_architecture arm64 arm64 ||
     printf 'Podman responder image architecture validation is incorrect\n' >&2
     exit 1
 fi
+
+if ! extract_function start_ndpresponder | grep -Fq -- '--restart on-failure:3'; then
+    printf 'ndpresponder must use a bounded failure restart policy\n' >&2
+    exit 1
+fi
+if extract_function start_ndpresponder | grep -Fq -- '--restart always'; then
+    printf 'ndpresponder must not use an unconditional restart policy\n' >&2
+    exit 1
+fi
+
+# A stale image must be rejected when manual routed mode needs the hot-reloaded
+# target file. The probe is deliberately isolated from the later Podman mocks.
+if ! (
+    # shellcheck disable=SC2329 # Invoked by the dynamically sourced capability probe.
+    podman() {
+        [[ "${1:-}" == run ]] || return 1
+        printf '%s\n' '      --target-file value  reloadable static targets'
+    }
+    ndpresponder_supports_target_file stale-image
+); then
+    printf 'target-file capability probe rejected a compatible image\n' >&2
+    exit 1
+fi
+if (
+    # shellcheck disable=SC2329 # Invoked by the dynamically sourced capability probe.
+    podman() {
+        [[ "${1:-}" == run ]] || return 1
+        printf '%s\n' '      -n value  static targets'
+    }
+    ndpresponder_supports_target_file stale-image
+); then
+    printf 'target-file capability probe accepted a stale image\n' >&2
+    exit 1
+fi
+
+# Manual routed IPv6 relies on the hot-reloaded target file. A stale responder
+# launched with --restart always must be removed before a failed source build
+# can leave it consuming CPU in a restart loop.
+# shellcheck disable=SC2329 # Invoked by the dynamically sourced quarantine helper.
+_yellow() { :; }
+NDPRESPONDER_TARGET_FILE_REQUIRED=true
+manual_quarantine_updated=false
+manual_quarantine_removed=false
+# shellcheck disable=SC2329 # Invoked by the dynamically sourced quarantine helper.
+podman() {
+    case "$1:$2" in
+        inspect:ndpresponder)
+            return 0
+            ;;
+        inspect:-f)
+            printf '%s\n' stale-responder-image
+            return 0
+            ;;
+        run:--rm)
+            printf '%s\n' '      -n value  static targets'
+            return 0
+            ;;
+        update:--restart=no)
+            manual_quarantine_updated=true
+            return 0
+            ;;
+        rm:-f)
+            manual_quarantine_removed=true
+            return 0
+            ;;
+        *)
+            printf 'unexpected podman invocation during manual responder quarantine: %s\n' "$*" >&2
+            return 1
+            ;;
+    esac
+}
+quarantine_incompatible_manual_ndpresponder
+[[ "$manual_quarantine_updated" == true && "$manual_quarantine_removed" == true ]] || {
+    printf 'incompatible manual responder was not quarantined before a restart loop could continue\n' >&2
+    exit 1
+}
+# shellcheck disable=SC2034 # Read by the dynamically sourced responder starter.
+NDPRESPONDER_TARGET_FILE_REQUIRED=false
+
 if ! grep -Fq 'arm64) arch_tag="aarch64"' "$installer"; then
     printf 'Podman must select the published aarch64 responder tag on ARM64\n' >&2
     exit 1
