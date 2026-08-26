@@ -25,42 +25,42 @@ PODMAN_STATE_DIR=$(mktemp -d "${TMPDIR:-/tmp}/podman-ipv6-state.XXXXXX")
 trap 'rm -rf -- "$PODMAN_STATE_DIR"' EXIT
 
 # shellcheck disable=SC1090 # The test intentionally loads one installer helper.
-source <(extract_function podman_state_file)
+eval "$(extract_function podman_state_file)"
 
 # shellcheck disable=SC1090 # The test intentionally loads one installer function.
-source <(extract_function generate_ipv6_subnet_candidates)
+eval "$(extract_function generate_ipv6_subnet_candidates)"
 # shellcheck disable=SC1090 # The test intentionally loads one installer function.
-source <(extract_function is_public_ipv6)
+eval "$(extract_function is_public_ipv6)"
 # shellcheck disable=SC1090 # The test intentionally loads the CIDR selector.
-source <(extract_function select_public_ipv6_cidr)
+eval "$(extract_function select_public_ipv6_cidr)"
 # shellcheck disable=SC1090 # The test intentionally loads IPv6 uplink helpers.
-source <(extract_function podman_ipv6_uplink_interface)
+eval "$(extract_function podman_ipv6_uplink_interface)"
 # shellcheck disable=SC1090 # The test intentionally loads IPv6 uplink helpers.
-source <(extract_function podman_ipv6_uplink_supports_ndp)
+eval "$(extract_function podman_ipv6_uplink_supports_ndp)"
 # shellcheck disable=SC1090 # The test intentionally loads IPv6 responder state setup.
-source <(extract_function configure_podman_ipv6_ndp_state)
+eval "$(extract_function configure_podman_ipv6_ndp_state)"
 # shellcheck disable=SC1090 # The test intentionally loads one installer function.
-source <(extract_function normalize_ipv6_subnet)
+eval "$(extract_function normalize_ipv6_subnet)"
 # shellcheck disable=SC1090 # The test intentionally loads the ULA NAT66 validator.
-source <(extract_function normalize_ipv6_internal_subnet)
+eval "$(extract_function normalize_ipv6_internal_subnet)"
 # shellcheck disable=SC1090 # The test intentionally loads the ULA NAT66 state guard.
-source <(extract_function podman_ipv6_ula_state_matches_network)
+eval "$(extract_function podman_ipv6_ula_state_matches_network)"
 # shellcheck disable=SC1090 # The test intentionally loads the host-route guard.
-source <(extract_function ipv6_subnet_overlaps_host)
+eval "$(extract_function ipv6_subnet_overlaps_host)"
 # shellcheck disable=SC1090 # The test intentionally loads one installer function.
-source <(extract_function create_ipv6_network)
+eval "$(extract_function create_ipv6_network)"
 # shellcheck disable=SC1090 # The test intentionally loads one installer helper.
-source <(extract_function ndpresponder_image_matches_architecture)
+eval "$(extract_function ndpresponder_image_matches_architecture)"
 # shellcheck disable=SC1090 # The test intentionally loads one installer helper.
-source <(extract_function ndpresponder_supports_target_file)
+eval "$(extract_function ndpresponder_supports_target_file)"
 # shellcheck disable=SC1090 # The test intentionally loads one installer helper.
-source <(extract_function ndpresponder_image_supports_required_features)
+eval "$(extract_function ndpresponder_image_supports_required_features)"
 # shellcheck disable=SC1090 # The test intentionally loads one installer helper.
-source <(extract_function ndpresponder_existing_container_image)
+eval "$(extract_function ndpresponder_existing_container_image)"
 # shellcheck disable=SC1090 # The test intentionally loads one installer helper.
-source <(extract_function quarantine_incompatible_manual_ndpresponder)
+eval "$(extract_function quarantine_incompatible_manual_ndpresponder)"
 # shellcheck disable=SC1090 # The test intentionally loads the route-health helper.
-source <(extract_function podman_ipv6_network_has_explicit_default_route)
+eval "$(extract_function podman_ipv6_network_has_explicit_default_route)"
 
 host_cidr="2a14:6781:000a:0000:0009:0000:0000:0000/64"
 
@@ -402,7 +402,7 @@ fi
 # An old empty unmanaged network can be replaced safely, but the migration
 # must not remove a network that still has any attached container.
 # shellcheck disable=SC1090 # The test intentionally loads the migration helper.
-source <(extract_function migrate_unmanaged_ipv6_network_default_route)
+eval "$(extract_function migrate_unmanaged_ipv6_network_default_route)"
 # shellcheck disable=SC2329 # Invoked by the dynamically sourced installer helper.
 _yellow() { :; }
 # shellcheck disable=SC2329 # Invoked by the dynamically sourced installer helper.
@@ -499,9 +499,9 @@ fi
 # A broken remote ARM tag must not tear down a known-good responder before the
 # fallback source image has passed architecture validation.
 # shellcheck disable=SC1090 # The test intentionally loads the installer function.
-source <(extract_function resolve_ndpresponder_image)
+eval "$(extract_function resolve_ndpresponder_image)"
 # shellcheck disable=SC1090 # The test intentionally loads the installer function.
-source <(extract_function start_ndpresponder)
+eval "$(extract_function start_ndpresponder)"
 # NAT66 has no public container addresses to proxy. It must be considered
 # healthy without opening a Podman API socket or starting a responder process.
 printf '%s\n' nat >"$(podman_state_file podman_ipv6_network_mode)"
@@ -719,7 +719,7 @@ fi
 # A bridge creation that fails after adding a new bridge must run the same
 # ownership-aware cleanup used for a failed Podman network creation.
 # shellcheck disable=SC1090 # The test intentionally loads one installer function.
-source <(extract_function create_unmanaged_ipv6_network)
+eval "$(extract_function create_unmanaged_ipv6_network)"
 cleanup_called=false
 ipv6_gateway_for_subnet() { printf '%s\n' '2a14:6781:a:0:2::1'; }
 ensure_unmanaged_ipv6_bridge() {
@@ -741,9 +741,9 @@ fi
 # ports are still attached. It must not be repurposed when the old
 # podman-ipv6 network is already gone.
 # shellcheck disable=SC1090 # The test intentionally loads one installer function.
-source <(extract_function bridge_has_attached_interfaces)
+eval "$(extract_function bridge_has_attached_interfaces)"
 # shellcheck disable=SC1090 # The test intentionally loads one installer function.
-source <(extract_function ensure_unmanaged_ipv6_bridge)
+eval "$(extract_function ensure_unmanaged_ipv6_bridge)"
 ip() {
     case "$*" in
         'link show podman-br1') return 0 ;;

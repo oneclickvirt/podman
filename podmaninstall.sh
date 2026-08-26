@@ -1941,7 +1941,10 @@ create_ipv6_network() {
         fi
         prefixes=("$prefix")
     else
-        mapfile -t prefixes < <(generate_ipv6_subnet_candidates "$ipv6_cidr" 2>/dev/null || true)
+        prefixes=()
+        while IFS= read -r prefix; do
+            [ -n "$prefix" ] && prefixes+=("$prefix")
+        done < <(generate_ipv6_subnet_candidates "$ipv6_cidr" 2>/dev/null || true)
         if [[ ${#prefixes[@]} -eq 0 ]]; then
             _yellow "Cannot safely derive a managed public subnet from ${ipv6_cidr}; trying routed and NAT66 fallback modes"
             if create_manual_ipv6_network "$ipv6_cidr" "$net_err"; then
@@ -2143,7 +2146,7 @@ resolve_ndpresponder_image() {
 start_ndpresponder() {
     _yellow "Starting NDP responder for IPv6..."
     local podman_socket ndp_status ndp_logs ndp_image ndp_target_file network_mode ndp_required uplink
-    local -a ndp_args ndp_volume_args
+    local -a ndp_args podman_run_args
     if ! podman network exists podman-ipv6 2>/dev/null; then
         _yellow "podman-ipv6 network not found, skipping ndpresponder"
         return 1
@@ -2196,26 +2199,26 @@ start_ndpresponder() {
     ndp_image="$NDPRESPONDER_IMAGE"
     podman rm -f ndpresponder 2>/dev/null || true
     ndp_target_file=""
+    podman_run_args=(
+        --restart on-failure:3
+        --cpus 0.02
+        --memory 64m
+        --cap-drop=ALL
+        --cap-add=NET_RAW
+        --cap-add=NET_ADMIN
+        --network host
+        --volume "${podman_socket}:/var/run/docker.sock:ro"
+    )
     if [[ "$network_mode" == "manual" ]]; then
         ndp_target_file=$(podman_state_file podman_ipv6_targets)
         [[ -f "$ndp_target_file" ]] || : > "$ndp_target_file"
         ndp_args=(--target-file /etc/ndpresponder-targets)
-        ndp_volume_args=(--volume "${ndp_target_file}:/etc/ndpresponder-targets:ro")
+        podman_run_args+=(--volume "${ndp_target_file}:/etc/ndpresponder-targets:ro")
     else
         ndp_args=(-N podman-ipv6)
-        ndp_volume_args=()
     fi
     ndp_args=(-i "$uplink" "${ndp_args[@]}")
-    if podman run -d \
-        --restart on-failure:3 \
-        --cpus 0.02 \
-        --memory 64m \
-        --cap-drop=ALL \
-        --cap-add=NET_RAW \
-        --cap-add=NET_ADMIN \
-        --network host \
-        --volume "${podman_socket}:/var/run/docker.sock:ro" \
-        "${ndp_volume_args[@]}" \
+    if podman run -d "${podman_run_args[@]}" \
         -e DOCKER_HOST=unix:///var/run/docker.sock \
         --name ndpresponder \
         "${ndp_image}" \
