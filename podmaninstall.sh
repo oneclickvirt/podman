@@ -853,6 +853,153 @@ set_ipv6_network_mode() {
     printf '%s\n' "$1" > "$(podman_state_file podman_ipv6_network_mode)"
 }
 
+# A host with only one public /128 still has IPv6 connectivity, but it cannot
+# safely donate that address to a container.  Keep the bridge private in that
+# case and use NAT66 for outbound IPv6 instead of treating the /128 as a
+# routable allocation pool.
+podman_ipv6_ula_state_matches_network() {
+    local recorded_mode="$1" recorded_subnet="$2" network_subnet="$3"
+    [[ "$recorded_mode" == "nat" && "$recorded_subnet" == "$network_subnet" ]] || return 1
+    normalize_ipv6_internal_subnet "$network_subnet" >/dev/null
+}
+
+configure_podman_ipv6_nat66() {
+    local subnet="$1" postrouting forward nft_table="oneclickvirt_podman_ipv6"
+    normalize_ipv6_internal_subnet "$subnet" >/dev/null || return 1
+
+    # Prefer ip6tables when available so the allowance follows Netavark's
+    # usual firewall path.  The nft fallback is for hosts without iptables.
+    if command -v ip6tables >/dev/null 2>&1; then
+        ip6tables -C FORWARD -s "$subnet" -j ACCEPT 2>/dev/null || ip6tables -A FORWARD -s "$subnet" -j ACCEPT 2>/dev/null || return 1
+        ip6tables -C FORWARD -d "$subnet" -j ACCEPT 2>/dev/null || ip6tables -A FORWARD -d "$subnet" -j ACCEPT 2>/dev/null || return 1
+        ip6tables -t nat -C POSTROUTING -s "$subnet" ! -d "$subnet" -j MASQUERADE 2>/dev/null || \
+            ip6tables -t nat -A POSTROUTING -s "$subnet" ! -d "$subnet" -j MASQUERADE 2>/dev/null || return 1
+        ip6tables -t nat -C POSTROUTING -s "$subnet" ! -d "$subnet" -j MASQUERADE 2>/dev/null && \
+            ip6tables -C FORWARD -s "$subnet" -j ACCEPT 2>/dev/null && \
+            ip6tables -C FORWARD -d "$subnet" -j ACCEPT 2>/dev/null
+        return
+    fi
+
+    if command -v nft >/dev/null 2>&1 && nft list ruleset >/dev/null 2>&1; then
+        nft add table ip6 "$nft_table" 2>/dev/null || true
+        nft "add chain ip6 ${nft_table} forward { type filter hook forward priority filter; policy accept; }" 2>/dev/null || true
+        nft "add chain ip6 ${nft_table} postrouting { type nat hook postrouting priority srcnat; policy accept; }" 2>/dev/null || true
+        postrouting=$(nft list chain ip6 "$nft_table" postrouting 2>/dev/null || true)
+        forward=$(nft list chain ip6 "$nft_table" forward 2>/dev/null || true)
+        if ! grep -Fq "ip6 saddr ${subnet}" <<<"$postrouting" || ! grep -Fq 'masquerade' <<<"$postrouting"; then
+            nft add rule ip6 "$nft_table" postrouting ip6 saddr "$subnet" ip6 daddr != "$subnet" masquerade 2>/dev/null || return 1
+        fi
+        if ! grep -Fq "ip6 saddr ${subnet} accept" <<<"$forward"; then
+            nft add rule ip6 "$nft_table" forward ip6 saddr "$subnet" accept 2>/dev/null || return 1
+        fi
+        if ! grep -Fq "ip6 daddr ${subnet} accept" <<<"$forward"; then
+            nft add rule ip6 "$nft_table" forward ip6 daddr "$subnet" accept 2>/dev/null || return 1
+        fi
+        postrouting=$(nft list chain ip6 "$nft_table" postrouting 2>/dev/null || true)
+        forward=$(nft list chain ip6 "$nft_table" forward 2>/dev/null || true)
+        grep -Fq "ip6 saddr ${subnet}" <<<"$postrouting" && \
+            grep -Fq 'masquerade' <<<"$postrouting" && \
+            grep -Fq "ip6 saddr ${subnet} accept" <<<"$forward" && \
+            grep -Fq "ip6 daddr ${subnet} accept" <<<"$forward"
+        return
+    fi
+    return 1
+}
+
+install_podman_ipv6_nat66_service() {
+    local helper=/usr/local/bin/podman-ipv6-nat.sh
+    cat > "$helper" <<'EOF'
+#!/bin/bash
+# OneClickVirt Podman IPv6 NAT66 restore helper.
+set -u
+
+state_dir=/usr/local/bin
+mode=$(tr -d '[:space:]' <"${state_dir}/podman_ipv6_network_mode" 2>/dev/null || true)
+subnet=$(tr -d '[:space:]' <"${state_dir}/podman_ipv6_subnet" 2>/dev/null || true)
+[[ "$mode" == nat && -n "$subnet" ]] || exit 0
+
+python3 - "$subnet" <<'PY'
+import ipaddress
+import sys
+try:
+    network = ipaddress.IPv6Network(sys.argv[1], strict=False)
+except ValueError:
+    raise SystemExit(1)
+raise SystemExit(0 if network.prefixlen == 64 and network.subnet_of(ipaddress.IPv6Network("fc00::/7")) else 1)
+PY
+
+if command -v ip6tables >/dev/null 2>&1; then
+    ip6tables -C FORWARD -s "$subnet" -j ACCEPT 2>/dev/null || ip6tables -A FORWARD -s "$subnet" -j ACCEPT || exit 1
+    ip6tables -C FORWARD -d "$subnet" -j ACCEPT 2>/dev/null || ip6tables -A FORWARD -d "$subnet" -j ACCEPT || exit 1
+    ip6tables -t nat -C POSTROUTING -s "$subnet" ! -d "$subnet" -j MASQUERADE 2>/dev/null || \
+        ip6tables -t nat -A POSTROUTING -s "$subnet" ! -d "$subnet" -j MASQUERADE || exit 1
+    exit 0
+fi
+
+command -v nft >/dev/null 2>&1 && nft list ruleset >/dev/null 2>&1 || exit 1
+nft_table=oneclickvirt_podman_ipv6
+nft add table ip6 "$nft_table" 2>/dev/null || true
+nft "add chain ip6 ${nft_table} forward { type filter hook forward priority filter; policy accept; }" 2>/dev/null || true
+nft "add chain ip6 ${nft_table} postrouting { type nat hook postrouting priority srcnat; policy accept; }" 2>/dev/null || true
+postrouting=$(nft list chain ip6 "$nft_table" postrouting 2>/dev/null || true)
+forward=$(nft list chain ip6 "$nft_table" forward 2>/dev/null || true)
+grep -Fq "ip6 saddr ${subnet}" <<<"$postrouting" || \
+    nft add rule ip6 "$nft_table" postrouting ip6 saddr "$subnet" ip6 daddr != "$subnet" masquerade || exit 1
+grep -Fq "ip6 saddr ${subnet} accept" <<<"$forward" || \
+    nft add rule ip6 "$nft_table" forward ip6 saddr "$subnet" accept || exit 1
+grep -Fq "ip6 daddr ${subnet} accept" <<<"$forward" || \
+    nft add rule ip6 "$nft_table" forward ip6 daddr "$subnet" accept || exit 1
+EOF
+    chmod 700 "$helper"
+
+    if command -v systemctl >/dev/null 2>&1; then
+        cat > /etc/systemd/system/podman-ipv6-nat.service <<'EOF'
+[Unit]
+Description=Restore OneClickVirt Podman IPv6 NAT66 rules
+After=network-online.target podman.service
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/bin/podman-ipv6-nat.sh
+
+[Install]
+WantedBy=multi-user.target
+EOF
+        systemctl daemon-reload 2>/dev/null || true
+        systemctl enable --now podman-ipv6-nat.service 2>/dev/null || \
+            _yellow "Could not enable podman-ipv6-nat.service; verify NAT66 after reboot"
+        return 0
+    fi
+
+    if command -v rc-update >/dev/null 2>&1 && command -v rc-service >/dev/null 2>&1; then
+        cat > /etc/init.d/podman-ipv6-nat <<'EOF'
+#!/sbin/openrc-run
+# OneClickVirt Podman IPv6 NAT66 restore service.
+
+description="Restore OneClickVirt Podman IPv6 NAT66 rules"
+
+depend() {
+    need net
+    after podman
+}
+
+start() {
+    ebegin "$description"
+    /usr/local/bin/podman-ipv6-nat.sh
+    eend $?
+}
+EOF
+        chmod 700 /etc/init.d/podman-ipv6-nat
+        rc-update add podman-ipv6-nat default 2>/dev/null || true
+        rc-service podman-ipv6-nat restart 2>/dev/null || \
+            _yellow "Could not start podman-ipv6-nat OpenRC service; verify NAT66 after reboot"
+        return 0
+    fi
+
+    _yellow "No service manager found; verify Podman IPv6 NAT66 rules after reboot"
+}
+
 ipv6_gateway_for_subnet() {
     local subnet="$1"
     local py_bin
@@ -1540,6 +1687,45 @@ create_manual_ipv6_network() {
     return 0
 }
 
+# Keep IPv6 usable when the host has connectivity but no public address pool
+# that can be delegated to containers.  This is the only safe mode for a lone
+# public /128 and remains a fallback when a routed-prefix setup cannot be used.
+create_podman_nat66_ipv6_network() {
+    local public_parent="$1" net_err="$2" subnet gateway
+    subnet=$(choose_manual_ipv6_subnet 2>/dev/null || true)
+    [[ -n "$subnet" ]] || {
+        _yellow "Could not find a free ULA subnet for the Podman NAT66 bridge"
+        return 1
+    }
+    gateway=$(ipv6_gateway_for_subnet "$subnet" 2>/dev/null || true)
+    [[ -n "$gateway" ]] || return 1
+
+    if ! create_managed_ipv6_network "$subnet" "$net_err"; then
+        _yellow "Podman ULA NAT66 network creation failed: $(cat "$net_err" 2>/dev/null)"
+        return 1
+    fi
+    if ! configure_podman_ipv6_nat66 "$subnet"; then
+        podman network rm podman-ipv6 >/dev/null 2>&1 || true
+        _yellow "Podman ULA bridge was created but NAT66 could not be installed"
+        return 1
+    fi
+
+    printf '%s\n' "$subnet" > "$(podman_state_file podman_ipv6_subnet)"
+    printf '%s\n' "$public_parent" > "$(podman_state_file podman_ipv6_public_parent)"
+    set_ipv6_network_mode nat
+    rm -f \
+        "$(podman_state_file podman_ipv6_public_prefix)" \
+        "$(podman_state_file podman_ipv6_manual_subnet)" \
+        "$(podman_state_file podman_ipv6_manual_gateway)" \
+        "$(podman_state_file podman_ipv6_manual_bridge)" \
+        "$(podman_state_file podman_ipv6_allocations)" \
+        "$(podman_state_file podman_ipv6_targets)"
+    install_podman_ipv6_nat66_service
+    _green "podman-ipv6 created (isolated ULA NAT66): IPv6=${subnet}"
+    _yellow "The host has no delegable public IPv6 pool; containers retain outbound IPv6 through NAT66 and do not receive public /128 addresses"
+    return 0
+}
+
 migrate_unmanaged_ipv6_network_default_route() {
     local prefix net_err
 
@@ -1595,13 +1781,29 @@ migrate_unmanaged_ipv6_network_default_route() {
 
 create_ipv6_network() {
     local ipv6_cidr="$1"
-    local prefix net_err managed_error
+    local prefix net_err managed_error network_subnet recorded_mode recorded_subnet
     local -a prefixes=()
     local manual_attempted=false
     _yellow "Creating Podman IPv6 network (podman-ipv6)..."
     if podman network exists podman-ipv6 2>/dev/null; then
         managed_error=$(podman network inspect -f '{{index .Options "mode"}}' podman-ipv6 2>/dev/null || true)
-        if [[ "$managed_error" == "manual" ]] || [[ -s "$(podman_state_file podman_ipv6_public_prefix)" && -s "$(podman_state_file podman_ipv6_manual_subnet)" ]]; then
+        network_subnet=$(podman_ipv6_network_subnet 2>/dev/null || true)
+        recorded_mode=$(cat "$(podman_state_file podman_ipv6_network_mode)" 2>/dev/null | tr -d '[:space:]' || true)
+        recorded_subnet=$(cat "$(podman_state_file podman_ipv6_subnet)" 2>/dev/null | tr -d '[:space:]' || true)
+        if [[ "$recorded_mode" == "nat" ]]; then
+            if ! podman_ipv6_ula_state_matches_network "$recorded_mode" "$recorded_subnet" "$network_subnet"; then
+                _yellow "Existing podman-ipv6 network is not the installer-managed ULA NAT66 network; preserving its current mode"
+                return 1
+            fi
+            if ! configure_podman_ipv6_nat66 "$network_subnet"; then
+                _yellow "Could not restore NAT66 for the existing podman-ipv6 network"
+                return 1
+            fi
+            printf '%s\n' "$ipv6_cidr" > "$(podman_state_file podman_ipv6_public_parent)"
+            set_ipv6_network_mode nat
+            install_podman_ipv6_nat66_service
+            _green "Reusing installer-managed Podman ULA NAT66 network: ${network_subnet}"
+        elif [[ "$managed_error" == "manual" ]] || [[ -s "$(podman_state_file podman_ipv6_public_prefix)" && -s "$(podman_state_file podman_ipv6_manual_subnet)" ]]; then
             if [[ ! -x /usr/local/bin/podman-ipv6-attach.sh ]]; then
                 install_manual_ipv6_attach_helper
             fi
@@ -1623,17 +1825,34 @@ create_ipv6_network() {
         return 0
     fi
 
+    net_err=$(mktemp /tmp/podman-net.XXXXXX 2>/dev/null || true)
+    [[ -n "$net_err" ]] || net_err="/tmp/podman-net.$$"
+
     if [[ -n "${PODMAN_IPV6_SUBNET:-}" ]]; then
         prefix=$(normalize_ipv6_subnet "$PODMAN_IPV6_SUBNET" 2>/dev/null || true)
         if [[ -z "$prefix" ]]; then
+            local supplied_address="${PODMAN_IPV6_SUBNET%/*}" supplied_prefix="${PODMAN_IPV6_SUBNET##*/}"
+            if [[ "$PODMAN_IPV6_SUBNET" == */* ]] && [[ "$supplied_prefix" =~ ^[0-9]+$ ]] && \
+               (( 10#$supplied_prefix <= 128 )) && is_public_ipv6 "$supplied_address"; then
+                _yellow "PODMAN_IPV6_SUBNET=${PODMAN_IPV6_SUBNET} has no delegable public pool; using isolated ULA NAT66"
+                if create_podman_nat66_ipv6_network "$PODMAN_IPV6_SUBNET" "$net_err"; then
+                    rm -f "$net_err" 2>/dev/null || true
+                    return 0
+                fi
+                rm -f "$net_err" 2>/dev/null || true
+                return 1
+            fi
             _yellow "PODMAN_IPV6_SUBNET must be a public IPv6 CIDR shorter than /128"
+            rm -f "$net_err" 2>/dev/null || true
             return 1
         fi
         if ipv6_subnet_overlaps_host "$prefix"; then
             _yellow "PODMAN_IPV6_SUBNET=${prefix} overlaps a host route; switching to routed manual IPv6 mode"
-            net_err=$(mktemp /tmp/podman-net.XXXXXX 2>/dev/null || true)
-            [[ -n "$net_err" ]] || net_err="/tmp/podman-net.$$"
             if create_manual_ipv6_network "$prefix" "$net_err"; then
+                rm -f "$net_err" 2>/dev/null || true
+                return 0
+            fi
+            if create_podman_nat66_ipv6_network "$prefix" "$net_err"; then
                 rm -f "$net_err" 2>/dev/null || true
                 return 0
             fi
@@ -1644,13 +1863,20 @@ create_ipv6_network() {
     else
         mapfile -t prefixes < <(generate_ipv6_subnet_candidates "$ipv6_cidr" 2>/dev/null || true)
         if [[ ${#prefixes[@]} -eq 0 ]]; then
-            _yellow "Cannot safely derive a sibling subnet from ${ipv6_cidr}; set PODMAN_IPV6_SUBNET to a routed prefix"
+            _yellow "Cannot safely derive a managed public subnet from ${ipv6_cidr}; trying routed and NAT66 fallback modes"
+            if create_manual_ipv6_network "$ipv6_cidr" "$net_err"; then
+                rm -f "$net_err" 2>/dev/null || true
+                return 0
+            fi
+            if create_podman_nat66_ipv6_network "$ipv6_cidr" "$net_err"; then
+                rm -f "$net_err" 2>/dev/null || true
+                return 0
+            fi
+            rm -f "$net_err" 2>/dev/null || true
             return 1
         fi
     fi
 
-    net_err=$(mktemp /tmp/podman-net.XXXXXX 2>/dev/null || true)
-    [[ -n "$net_err" ]] || net_err="/tmp/podman-net.$$"
     for prefix in "${prefixes[@]}"; do
         if ipv6_subnet_has_live_address "$prefix"; then
             _yellow "Skipping IPv6 subnet ${prefix}: it contains a live host address"
@@ -1681,6 +1907,10 @@ create_ipv6_network() {
     # passed to Netavark, even when the specific host address is unused. Use the
     # manual routed bridge so the runtime only sees an isolated ULA network.
     if [[ "$manual_attempted" == false ]] && create_manual_ipv6_network "$ipv6_cidr" "$net_err"; then
+        rm -f "$net_err" 2>/dev/null || true
+        return 0
+    fi
+    if create_podman_nat66_ipv6_network "$ipv6_cidr" "$net_err"; then
         rm -f "$net_err" 2>/dev/null || true
         return 0
     fi
@@ -1837,6 +2067,11 @@ start_ndpresponder() {
         _yellow "podman-ipv6 network not found, skipping ndpresponder"
         return 1
     fi
+    network_mode=$(cat "$(podman_state_file podman_ipv6_network_mode)" 2>/dev/null || true)
+    if [[ "$network_mode" == "nat" ]]; then
+        _green "Podman IPv6 uses ULA NAT66; NDP responder is not required"
+        return 0
+    fi
     if command -v systemctl >/dev/null 2>&1; then
         systemctl start podman.socket 2>/dev/null || true
     fi
@@ -1845,7 +2080,6 @@ start_ndpresponder() {
         _yellow "Podman API socket not found; ndpresponder cannot track container IPv6 addresses"
         return 1
     fi
-    network_mode=$(cat "$(podman_state_file podman_ipv6_network_mode)" 2>/dev/null || true)
     if [[ "$network_mode" == "manual" ]]; then
         NDPRESPONDER_TARGET_FILE_REQUIRED=true
     else

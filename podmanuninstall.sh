@@ -43,6 +43,33 @@ is_project_ipv6_attach_unit() {
     local unit_file="/etc/systemd/system/podman-ipv6-attach.service"
     [[ -f "$unit_file" ]] && grep -q "Restore OneClickVirt Podman routed IPv6 addresses" "$unit_file" 2>/dev/null
 }
+is_project_ipv6_nat_unit() {
+    local unit_file="/etc/systemd/system/podman-ipv6-nat.service"
+    [[ -f "$unit_file" ]] && grep -q "Restore OneClickVirt Podman IPv6 NAT66 rules" "$unit_file" 2>/dev/null
+}
+is_project_ipv6_nat_openrc_service() {
+    local service_file="/etc/init.d/podman-ipv6-nat"
+    [[ -f "$service_file" ]] && grep -q "OneClickVirt Podman IPv6 NAT66 restore service" "$service_file" 2>/dev/null
+}
+is_project_ipv6_nat_helper() {
+    local helper="/usr/local/bin/podman-ipv6-nat.sh"
+    [[ -f "$helper" ]] && grep -q "OneClickVirt Podman IPv6 NAT66 restore helper" "$helper" 2>/dev/null
+}
+podman_ipv6_nat_state_is_safe() {
+    local mode subnet
+    mode=$(tr -d '[:space:]' <"$(podman_state_file podman_ipv6_network_mode)" 2>/dev/null || true)
+    subnet=$(tr -d '[:space:]' <"$(podman_state_file podman_ipv6_subnet)" 2>/dev/null || true)
+    [[ "$mode" == "nat" && -n "$subnet" ]] || return 1
+    python3 - "$subnet" <<'PY'
+import ipaddress
+import sys
+try:
+    network = ipaddress.IPv6Network(sys.argv[1], strict=False)
+except ValueError:
+    raise SystemExit(1)
+raise SystemExit(0 if network.prefixlen == 64 and network.subnet_of(ipaddress.IPv6Network("fc00::/7")) else 1)
+PY
+}
 
 # Set when an installer-owned unmanaged bridge cannot be deleted safely. The
 # ownership marker must outlive the uninstall so a subsequent install will not
@@ -158,6 +185,15 @@ if command -v systemctl >/dev/null 2>&1; then
             systemctl disable podman-ipv6-attach 2>/dev/null || true
         fi
     fi
+    if is_project_ipv6_nat_unit; then
+        if systemctl is-active --quiet podman-ipv6-nat 2>/dev/null; then
+            systemctl stop podman-ipv6-nat 2>/dev/null || true
+            _yellow "  已停止 podman-ipv6-nat"
+        fi
+        if systemctl is-enabled --quiet podman-ipv6-nat 2>/dev/null; then
+            systemctl disable podman-ipv6-nat 2>/dev/null || true
+        fi
+    fi
 fi
 f=/etc/systemd/system/check-dns-podman.service
 [[ -f "$f" ]] && rm -f "$f" && _yellow "  删除 $f"
@@ -173,12 +209,37 @@ f=/etc/systemd/system/podman-ipv6-attach.service
 if is_project_ipv6_attach_unit; then
     rm -f "$f" && _yellow "  删除 $f"
 fi
+f=/etc/systemd/system/podman-ipv6-nat.service
+if is_project_ipv6_nat_unit; then
+    rm -f "$f" && _yellow "  删除 $f"
+fi
 if command -v systemctl >/dev/null 2>&1; then
     systemctl daemon-reload 2>/dev/null || true
+fi
+if is_project_ipv6_nat_openrc_service; then
+    if command -v rc-service >/dev/null 2>&1; then
+        rc-service podman-ipv6-nat stop 2>/dev/null || true
+    fi
+    if command -v rc-update >/dev/null 2>&1; then
+        rc-update del podman-ipv6-nat default 2>/dev/null || true
+    fi
+    rm -f /etc/init.d/podman-ipv6-nat && _yellow "  删除 /etc/init.d/podman-ipv6-nat"
 fi
 
 # ======== 5. 删除 Podman 网络 ========
 _blue "[5/7] 删除 Podman 网络..."
+# Only remove rules when the recorded installer state proves that this is our
+# private ULA NAT66 subnet.  Never delete a generic host IPv6 rule based only
+# on the presence of a similarly named network.
+podman_ipv6_subnet=$(tr -d '[:space:]' <"$(podman_state_file podman_ipv6_subnet)" 2>/dev/null || true)
+if podman_ipv6_nat_state_is_safe && command -v ip6tables >/dev/null 2>&1; then
+    while ip6tables -t nat -D POSTROUTING -s "$podman_ipv6_subnet" ! -d "$podman_ipv6_subnet" -j MASQUERADE 2>/dev/null; do :; done
+    while ip6tables -D FORWARD -s "$podman_ipv6_subnet" -j ACCEPT 2>/dev/null; do :; done
+    while ip6tables -D FORWARD -d "$podman_ipv6_subnet" -j ACCEPT 2>/dev/null; do :; done
+fi
+if podman_ipv6_nat_state_is_safe && command -v nft >/dev/null 2>&1; then
+    nft delete table ip6 oneclickvirt_podman_ipv6 2>/dev/null || true
+fi
 if command -v podman >/dev/null 2>&1; then
     for net in podman-net podman-ipv6; do
         if podman network exists "$net" 2>/dev/null; then
@@ -271,6 +332,9 @@ for f in "${PODMAN_STATE_DIR%/}"/podman_*; do
 done
 [[ -f /usr/local/bin/podman-ipv6-bridge.sh ]] && rm -f /usr/local/bin/podman-ipv6-bridge.sh && _yellow "  删除 /usr/local/bin/podman-ipv6-bridge.sh"
 [[ -f /usr/local/bin/podman-ipv6-attach.sh ]] && rm -f /usr/local/bin/podman-ipv6-attach.sh && _yellow "  删除 /usr/local/bin/podman-ipv6-attach.sh"
+if is_project_ipv6_nat_helper; then
+    rm -f /usr/local/bin/podman-ipv6-nat.sh && _yellow "  删除 /usr/local/bin/podman-ipv6-nat.sh"
+fi
 [[ -f /usr/local/bin/check-dns-podman.sh ]] && rm -f /usr/local/bin/check-dns-podman.sh && _yellow "  删除 /usr/local/bin/check-dns-podman.sh"
 rm -f /tmp/spiritlhl_*.tar.gz 2>/dev/null || true
 rm -f /tmp/ssh_bash.sh /tmp/ssh_sh.sh 2>/dev/null || true

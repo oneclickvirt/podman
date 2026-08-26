@@ -35,6 +35,10 @@ source <(extract_function is_public_ipv6)
 source <(extract_function select_public_ipv6_cidr)
 # shellcheck disable=SC1090 # The test intentionally loads one installer function.
 source <(extract_function normalize_ipv6_subnet)
+# shellcheck disable=SC1090 # The test intentionally loads the ULA NAT66 validator.
+source <(extract_function normalize_ipv6_internal_subnet)
+# shellcheck disable=SC1090 # The test intentionally loads the ULA NAT66 state guard.
+source <(extract_function podman_ipv6_ula_state_matches_network)
 # shellcheck disable=SC1090 # The test intentionally loads the host-route guard.
 source <(extract_function ipv6_subnet_overlaps_host)
 # shellcheck disable=SC1090 # The test intentionally loads one installer function.
@@ -65,6 +69,9 @@ ip() {
             tunnel)
                 printf '%s\n' '5: he-ipv6 inet6 2001:470:1f14:9::2/64 scope global'
                 ;;
+            hostonly)
+                printf '%s\n' '2: eth0 inet6 2a14:6781:000a:0000::9/128 scope global'
+                ;;
             *)
                 printf '%s\n' '2: eth0 inet6 2605:52c0:2:14b:be24:11ff:fe6e:d967/64 scope global'
                 ;;
@@ -90,6 +97,12 @@ if [[ "$selected" != '2001:470:1f14:9::2/64' ]]; then
     printf 'tunnel /64 selection returned %q\n' "$selected" >&2
     exit 1
 fi
+IPV6_TEST_SCENARIO=hostonly
+selected=$(select_public_ipv6_cidr)
+if [[ "$selected" != '2a14:6781:000a:0000::9/128' ]]; then
+    printf 'host-only /128 selection returned %q\n' "$selected" >&2
+    exit 1
+fi
 unset IPV6_TEST_SCENARIO
 if ! ipv6_subnet_overlaps_host "2605:52c0:2:14b:1::/112"; then
     printf 'host connected IPv6 route was not detected as an overlap\n' >&2
@@ -101,10 +114,48 @@ if ipv6_subnet_overlaps_host "2a14:6781:a::/112"; then
 fi
 unset -f ip
 
+managed_ula='fd42:5339:296f:1d00::/64'
+if ! podman_ipv6_ula_state_matches_network nat "$managed_ula" "$managed_ula"; then
+    printf 'installer-managed Podman ULA was not accepted for NAT66 reuse\n' >&2
+    exit 1
+fi
+if podman_ipv6_ula_state_matches_network manual "$managed_ula" "$managed_ula" || \
+   podman_ipv6_ula_state_matches_network nat 'fd42:5339:296f:1d01::/64' "$managed_ula" || \
+   podman_ipv6_ula_state_matches_network nat '2a14:6781:a::/64' '2a14:6781:a::/64'; then
+    printf 'unmanaged or mismatched Podman ULA was accepted for NAT66 reuse\n' >&2
+    exit 1
+fi
+
 # The migration test exercises the decision path only; network mutation is
 # stubbed so it remains safe for an unprivileged macOS/Linux test runner.
 # shellcheck disable=SC2329 # Invoked by the dynamically sourced network creator.
 create_manual_ipv6_network() { return 1; }
+
+# A single routed /128 has usable host IPv6 but no address pool. The network
+# creator must retain outbound IPv6 by choosing its private NAT66 mode.
+nat66_parent=''
+# shellcheck disable=SC2329 # Invoked by the dynamically sourced network creator.
+create_podman_nat66_ipv6_network() {
+    nat66_parent="$1"
+    return 0
+}
+# shellcheck disable=SC2329 # Invoked by the dynamically sourced network creator.
+_yellow() { :; }
+# shellcheck disable=SC2329 # Invoked by the dynamically sourced network creator.
+podman() {
+    [[ "$*" == 'network exists podman-ipv6' ]] && return 1
+    return 1
+}
+# shellcheck disable=SC2034 # Read by the dynamically sourced IPv6 network creator.
+PODMAN_IPV6_SUBNET=''
+if ! create_ipv6_network '2a14:6781:000a:0000::9/128'; then
+    printf 'host-only /128 did not fall back to Podman ULA NAT66\n' >&2
+    exit 1
+fi
+if [[ "$nat66_parent" != '2a14:6781:000a:0000::9/128' ]]; then
+    printf 'Podman NAT66 fallback used unexpected parent %q\n' "$nat66_parent" >&2
+    exit 1
+fi
 
 candidates=()
 while IFS= read -r candidate; do
@@ -375,6 +426,32 @@ fi
 source <(extract_function resolve_ndpresponder_image)
 # shellcheck disable=SC1090 # The test intentionally loads the installer function.
 source <(extract_function start_ndpresponder)
+# NAT66 has no public container addresses to proxy. It must be considered
+# healthy without opening a Podman API socket or starting a responder process.
+printf '%s\n' nat >"$(podman_state_file podman_ipv6_network_mode)"
+nat66_socket_called=false
+# shellcheck disable=SC2329 # Invoked by the dynamically sourced responder starter.
+podman_api_socket() {
+    nat66_socket_called=true
+    return 1
+}
+# shellcheck disable=SC2329 # Invoked by the dynamically sourced responder starter.
+_green() { :; }
+# shellcheck disable=SC2329 # Invoked by the dynamically sourced responder starter.
+podman() {
+    [[ "$*" == 'network exists podman-ipv6' ]] && return 0
+    printf 'unexpected Podman invocation during NAT66 responder bypass: %s\n' "$*" >&2
+    return 1
+}
+if ! start_ndpresponder; then
+    printf 'Podman NAT66 unnecessarily required ndpresponder\n' >&2
+    exit 1
+fi
+[[ "$nat66_socket_called" == false ]] || {
+    printf 'Podman NAT66 attempted to open the API socket\n' >&2
+    exit 1
+}
+printf '%s\n' '' >"$(podman_state_file podman_ipv6_network_mode)"
 # shellcheck disable=SC2329 # Invoked by the dynamically sourced installer function.
 _yellow() { :; }
 # shellcheck disable=SC2034 # Read by the dynamically sourced installer function.
