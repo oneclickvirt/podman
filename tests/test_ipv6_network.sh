@@ -31,6 +31,8 @@ source <(extract_function podman_state_file)
 source <(extract_function generate_ipv6_subnet_candidates)
 # shellcheck disable=SC1090 # The test intentionally loads one installer function.
 source <(extract_function is_public_ipv6)
+# shellcheck disable=SC1090 # The test intentionally loads the CIDR selector.
+source <(extract_function select_public_ipv6_cidr)
 # shellcheck disable=SC1090 # The test intentionally loads one installer function.
 source <(extract_function normalize_ipv6_subnet)
 # shellcheck disable=SC1090 # The test intentionally loads the host-route guard.
@@ -55,11 +57,40 @@ host_cidr="2a14:6781:000a:0000:0009:0000:0000:0000/64"
 # shellcheck disable=SC2329 # Invoked by the dynamically sourced IPv6 helper.
 ip() {
     if [[ "$1" == "-6" && "$2" == "-o" && "$3" == "addr" ]]; then
-        printf '%s\n' '2: eth0 inet6 2605:52c0:2:14b:be24:11ff:fe6e:d967/64 scope global'
+        case "${IPV6_TEST_SCENARIO:-default}" in
+            delegated)
+                printf '%s\n' '2: vmbr0 inet6 2a14:7c0:1002:10f8::1/128 scope global'
+                printf '%s\n' '4: vmbr2 inet6 2a14:7c0:1002:10f8::1/38 scope global'
+                ;;
+            tunnel)
+                printf '%s\n' '5: he-ipv6 inet6 2001:470:1f14:9::2/64 scope global'
+                ;;
+            *)
+                printf '%s\n' '2: eth0 inet6 2605:52c0:2:14b:be24:11ff:fe6e:d967/64 scope global'
+                ;;
+        esac
     elif [[ "$1" == "-6" && "$2" == "route" ]]; then
         printf '%s\n' '2605:52c0:2:14b::/64 dev eth0 proto kernel'
     fi
 }
+selected=$(select_public_ipv6_cidr)
+if [[ "$selected" != '2605:52c0:2:14b:be24:11ff:fe6e:d967/64' ]]; then
+    printf 'normal /64 selection returned %q\n' "$selected" >&2
+    exit 1
+fi
+IPV6_TEST_SCENARIO=delegated
+selected=$(select_public_ipv6_cidr)
+if [[ "$selected" != '2a14:7c0:1002:10f8::1/38' ]]; then
+    printf 'delegated /38 was hidden by an uplink /128: %q\n' "$selected" >&2
+    exit 1
+fi
+IPV6_TEST_SCENARIO=tunnel
+selected=$(select_public_ipv6_cidr)
+if [[ "$selected" != '2001:470:1f14:9::2/64' ]]; then
+    printf 'tunnel /64 selection returned %q\n' "$selected" >&2
+    exit 1
+fi
+unset IPV6_TEST_SCENARIO
 if ! ipv6_subnet_overlaps_host "2605:52c0:2:14b:1::/112"; then
     printf 'host connected IPv6 route was not detected as an overlap\n' >&2
     exit 1

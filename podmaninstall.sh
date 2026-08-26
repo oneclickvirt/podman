@@ -483,21 +483,40 @@ raise SystemExit(1)
 ' "$subnet"
 }
 
+# Prefer a delegated bridge or tunnel prefix over a primary-uplink /128.
+# The first address returned by iproute2 is not an allocation policy: PVE
+# hosts commonly expose the /128 first and their usable /38 on vmbr2 later.
+# A lone /128 remains a valid connectivity signal and is retained as a
+# fallback for IPv6 modes that do not allocate public child addresses.
+select_public_ipv6_cidr() {
+    local candidate address prefix prefix_number best_cidr="" best_prefix=129
+    while IFS= read -r candidate; do
+        [[ -n "$candidate" ]] || continue
+        address="${candidate%/*}"
+        prefix="${candidate##*/}"
+        [[ "$prefix" =~ ^[0-9]+$ ]] || continue
+        prefix_number=$((10#$prefix))
+        (( prefix_number <= 128 )) || continue
+        if is_public_ipv6 "$address" && (( prefix_number < best_prefix )); then
+            best_cidr="$candidate"
+            best_prefix=$prefix_number
+        fi
+    done < <(ip -6 -o addr show scope global 2>/dev/null | awk '$0 !~ / tentative/ {print $4}')
+    [[ -n "$best_cidr" ]] || return 1
+    printf '%s\n' "$best_cidr"
+}
+
 check_ipv6() {
     IPV6=""
     IPV6_CIDR=""
     IPV6_ENABLED=false
-    local candidate addr
-    while IFS= read -r candidate; do
-        [[ -n "$candidate" ]] || continue
-        addr="${candidate%/*}"
-        if is_public_ipv6 "$addr"; then
-            IPV6="$addr"
-            IPV6_CIDR="$candidate"
-            IPV6_ENABLED=true
-            break
-        fi
-    done < <(ip -6 -o addr show scope global 2>/dev/null | awk '$0 !~ / tentative/ {print $4}')
+    local candidate
+    candidate=$(select_public_ipv6_cidr || true)
+    if [[ -n "$candidate" ]]; then
+        IPV6_CIDR="$candidate"
+        IPV6="${candidate%/*}"
+        IPV6_ENABLED=true
+    fi
 
     if [[ "$IPV6_ENABLED" == true ]]; then
         _green "Locally bound public IPv6 detected: $IPV6 ($IPV6_CIDR)"
