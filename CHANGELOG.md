@@ -1,3 +1,8 @@
+2026.08.27
+- IPv6 前缀选择改为优先可分配的本机前缀，兼容 PVE 上联 /128 与委派 /38 并存、SIT/6in4 隧道及 /120、/127 等窄前缀
+- Netavark 公网子网与宿主路由重叠时改用手动路由 /128 或 ULA NAT66，避免重复提交已被宿主占用的 IPv6 子网
+- NDP 仅在以太网上联需要；NAT66 和非以太网隧道不再因 responder 未运行而禁用容器 IPv6，并保留上游 IPv6 默认网关地址
+
 2026.07.23
 - 修复批量创建在 btrfs 环境传递 `--storage-opt size=...` 导致 Podman 报 `unknown option size` 的问题
 - 单容器和批量创建统一改用 btrfs qgroup 设置容器 rootfs 磁盘上限，配额应用失败时自动删除未启动容器

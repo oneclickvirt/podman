@@ -1,7 +1,7 @@
 #!/bin/bash
 # from
 # https://github.com/oneclickvirt/podman
-# 2026.08.26
+# 2026.08.27
 
 # Usage:
 # ./onepodman.sh <name> <cpu> <memory_mb> <password> <sshport> <startport> <endport> [independent_ipv6:y/n] [system] [disk_gb]
@@ -334,7 +334,7 @@ check_cdn_file() {
 
 check_cdn_file
 
-# ======== IPv6 条件检测（三重：网络存在 + ndpresponder 运行 + 地址文件有值）========
+# ======== IPv6 条件检测（按网络模式决定是否需要 NDP responder）========
 IPV6_ENABLED=false
 IPV6_NETWORK_MODE="managed"
 if [[ "$ROOTLESS_MODE" == "true" ]]; then
@@ -344,41 +344,55 @@ if [[ "$ROOTLESS_MODE" == "true" ]]; then
     fi
 elif [[ -f "$(podman_state_file podman_ipv6_enabled)" ]] && \
      [[ "$(cat "$(podman_state_file podman_ipv6_enabled)")" == "true" ]]; then
-    # 条件1：podman-ipv6 网络存在
     if podman network exists podman-ipv6 2>/dev/null; then
-        # 条件2：ndpresponder 容器正在运行
-        ndp_status=$(podman inspect -f '{{.State.Status}}' ndpresponder 2>/dev/null || echo "")
-        if [[ "$ndp_status" == "running" ]]; then
-            # 条件3：IPv6 地址文件有值
-            if [[ -f "$(podman_state_file podman_check_ipv6)" ]] && \
-               [[ -s "$(podman_state_file podman_check_ipv6)" ]]; then
-                IPV6_ENABLED=true
-                if [[ -f "$(podman_state_file podman_ipv6_network_mode)" ]]; then
-                    IPV6_NETWORK_MODE=$(tr -d '[:space:]' <"$(podman_state_file podman_ipv6_network_mode)" 2>/dev/null || true)
+        if [[ -f "$(podman_state_file podman_check_ipv6)" ]] && \
+           [[ -s "$(podman_state_file podman_check_ipv6)" ]]; then
+            if [[ -f "$(podman_state_file podman_ipv6_network_mode)" ]]; then
+                IPV6_NETWORK_MODE=$(tr -d '[:space:]' <"$(podman_state_file podman_ipv6_network_mode)" 2>/dev/null || true)
+            fi
+            case "$IPV6_NETWORK_MODE" in
+                ""|managed)
+                    IPV6_NETWORK_MODE="managed"
+                    ;;
+                nat)
+                    ;;
+                unmanaged)
+                    if ! podman network exists podman-net 2>/dev/null; then
+                        _yellow "Podman unmanaged IPv6 network is missing podman-net; falling back to IPv4"
+                        IPV6_NETWORK_MODE=""
+                    fi
+                    ;;
+                manual)
+                    if ! podman network exists podman-net 2>/dev/null || \
+                       [[ ! -x /usr/local/bin/podman-ipv6-attach.sh ]] || \
+                       [[ ! -s "$(podman_state_file podman_ipv6_public_prefix)" ]]; then
+                        _yellow "Podman manual IPv6 network is missing its IPv4 network or attach helper; falling back to IPv4"
+                        IPV6_NETWORK_MODE=""
+                    fi
+                    ;;
+                *)
+                    _yellow "Unknown Podman IPv6 network mode; falling back to IPv4"
+                    IPV6_NETWORK_MODE=""
+                    ;;
+            esac
+            if [[ -n "$IPV6_NETWORK_MODE" ]]; then
+                ndp_required="true"
+                if [[ -s "$(podman_state_file podman_ipv6_ndp_required)" ]]; then
+                    ndp_required=$(tr -d '[:space:]' <"$(podman_state_file podman_ipv6_ndp_required)" 2>/dev/null || true)
                 fi
-                case "$IPV6_NETWORK_MODE" in
-                    ""|managed)
-                        IPV6_NETWORK_MODE="managed"
-                        ;;
-                    unmanaged)
-                        if ! podman network exists podman-net 2>/dev/null; then
-                            _yellow "Podman unmanaged IPv6 network is missing podman-net; falling back to IPv4"
-                            IPV6_ENABLED=false
-                        fi
-                        ;;
-                    manual)
-                        if ! podman network exists podman-net 2>/dev/null || \
-                           [[ ! -x /usr/local/bin/podman-ipv6-attach.sh ]] || \
-                           [[ ! -s "$(podman_state_file podman_ipv6_public_prefix)" ]]; then
-                            _yellow "Podman manual IPv6 network is missing its IPv4 network or attach helper; falling back to IPv4"
-                            IPV6_ENABLED=false
-                        fi
-                        ;;
-                    *)
-                        _yellow "Unknown Podman IPv6 network mode; falling back to IPv4"
-                        IPV6_ENABLED=false
-                        ;;
-                esac
+                if [[ "$IPV6_NETWORK_MODE" == "nat" || "$ndp_required" == "false" ]]; then
+                    IPV6_ENABLED=true
+                    if [[ "$ndp_required" == "false" && "$IPV6_NETWORK_MODE" != "nat" ]]; then
+                        _green "Podman routed IPv6 uses a non-Ethernet uplink; NDP responder is not required"
+                    fi
+                else
+                    ndp_status=$(podman inspect -f '{{.State.Status}}' ndpresponder 2>/dev/null || true)
+                    if [[ "$ndp_status" == "running" ]]; then
+                        IPV6_ENABLED=true
+                    else
+                        _yellow "Podman IPv6 requires a healthy NDP responder on its Ethernet uplink; falling back to IPv4"
+                    fi
+                fi
             fi
         fi
     fi

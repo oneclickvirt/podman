@@ -1,7 +1,7 @@
 #!/bin/bash
 # from
 # https://github.com/oneclickvirt/podman
-# 2026.08.26
+# 2026.08.27
 _red()    { echo -e "\033[31m\033[01m$*\033[0m"; }
 _green()  { echo -e "\033[32m\033[01m$*\033[0m"; }
 _yellow() { echo -e "\033[33m\033[01m$*\033[0m"; }
@@ -506,6 +506,62 @@ select_public_ipv6_cidr() {
     printf '%s\n' "$best_cidr"
 }
 
+# The IPv6 default route identifies the NDP-facing uplink more reliably than
+# the IPv4 default route. Fall back to the complete selected CIDR so delegated
+# PVE bridges are not hidden by a separate /128 on another interface.
+podman_ipv6_uplink_interface() {
+    local uplink selected
+    uplink=$(ip -6 route show default 2>/dev/null | awk '
+        /^default / {
+            for (i = 1; i < NF; i++) {
+                if ($i == "dev") {
+                    print $(i + 1)
+                    exit
+                }
+            }
+        }
+    ')
+    if [[ -n "$uplink" ]] && ip link show dev "$uplink" >/dev/null 2>&1; then
+        printf '%s\n' "$uplink"
+        return 0
+    fi
+
+    selected=$(select_public_ipv6_cidr 2>/dev/null || true)
+    [[ "$selected" == */* ]] || return 1
+    uplink=$(ip -6 -o addr show scope global 2>/dev/null | awk -v cidr="$selected" '$4 == cidr {print $2; exit}')
+    [[ -n "$uplink" ]] || return 1
+    printf '%s\n' "$uplink"
+}
+
+podman_ipv6_uplink_supports_ndp() {
+    local uplink="$1" link_info
+    [[ -n "$uplink" ]] || return 1
+    link_info=$(ip -d link show dev "$uplink" 2>/dev/null || ip link show dev "$uplink" 2>/dev/null || true)
+    grep -q 'link/ether' <<<"$link_info"
+}
+
+# Record whether the current IPv6 topology really needs neighbor discovery.
+# SIT, ip6tnl and other non-Ethernet tunnels route IPv6 directly, so requiring
+# a raw-Ethernet responder there would disable an otherwise working network.
+configure_podman_ipv6_ndp_state() {
+    local network_mode uplink ndp_required=false
+    network_mode=""
+    if [[ -f "$(podman_state_file podman_ipv6_network_mode)" ]]; then
+        network_mode=$(tr -d '[:space:]' <"$(podman_state_file podman_ipv6_network_mode)" 2>/dev/null || true)
+    fi
+    uplink=$(podman_ipv6_uplink_interface 2>/dev/null || true)
+    if [[ -z "$uplink" ]]; then
+        _yellow "Could not determine the IPv6 uplink; independent IPv6 will remain disabled"
+        return 1
+    fi
+    if [[ "$network_mode" != "nat" ]] && podman_ipv6_uplink_supports_ndp "$uplink"; then
+        ndp_required=true
+    fi
+    printf '%s\n' "$uplink" > "$(podman_state_file podman_ipv6_uplink)"
+    printf '%s\n' "$ndp_required" > "$(podman_state_file podman_ipv6_ndp_required)"
+    return 0
+}
+
 check_ipv6() {
     IPV6=""
     IPV6_CIDR=""
@@ -836,16 +892,18 @@ create_podman_network() {
 }
 # ======== 配置 IPv6 内核参数 ========
 adapt_ipv6() {
+    local uplink
     _yellow "Configuring IPv6 kernel parameters..."
-    update_sysctl "net.ipv6.conf.all.forwarding=1"
-    update_sysctl "net.ipv6.conf.default.proxy_ndp=1"
-    update_sysctl "net.ipv6.conf.all.proxy_ndp=1"
-    if [[ -n "$interface" ]]; then
-        # Enabling forwarding makes Linux ignore normal router advertisements
-        # unless the uplink opts in explicitly. Preserve SLAAC default routes.
-        update_sysctl "net.ipv6.conf.${interface}.accept_ra=2"
-        update_sysctl "net.ipv6.conf.${interface}.proxy_ndp=1"
+    uplink=$(podman_ipv6_uplink_interface 2>/dev/null || true)
+    if [[ -z "$uplink" ]]; then
+        _yellow "Could not determine the IPv6 uplink; leaving host IPv6 settings unchanged"
+        return 1
     fi
+    update_sysctl "net.ipv6.conf.all.forwarding=1"
+    # Enabling forwarding makes Linux ignore normal router advertisements
+    # unless the actual IPv6 uplink opts in explicitly. ndpresponder answers
+    # NDP itself, so do not change global proxy_ndp state owned by the host.
+    update_sysctl "net.ipv6.conf.${uplink}.accept_ra=2"
     sysctl --system >/dev/null 2>&1 || true
 }
 # ======== 创建 Podman IPv6 网络 ========
@@ -1414,6 +1472,7 @@ allocate_address() {
     python3 - "$parent" "$map_file" "$gateway" <<'PY'
 import ipaddress
 import os
+import subprocess
 import sys
 
 parent = ipaddress.IPv6Network(sys.argv[1], strict=False)
@@ -1444,6 +1503,25 @@ try:
                 used.add(address)
 except OSError:
     pass
+try:
+    routes = subprocess.check_output(
+        ["ip", "-6", "route", "show", "default"],
+        text=True,
+        stderr=subprocess.DEVNULL,
+    )
+except (OSError, subprocess.CalledProcessError):
+    routes = ""
+for line in routes.splitlines():
+    fields = line.split()
+    for index, field in enumerate(fields[:-1]):
+        if field != "via":
+            continue
+        try:
+            upstream = ipaddress.IPv6Address(fields[index + 1])
+        except ValueError:
+            continue
+        if upstream in parent:
+            used.add(upstream)
 start = int(parent.network_address) + (0x1000 if parent.prefixlen <= 112 else 1)
 limit = min(int(parent.broadcast_address), start + 1_000_000)
 for value in range(start, limit + 1):
@@ -1719,7 +1797,9 @@ create_podman_nat66_ipv6_network() {
         "$(podman_state_file podman_ipv6_manual_gateway)" \
         "$(podman_state_file podman_ipv6_manual_bridge)" \
         "$(podman_state_file podman_ipv6_allocations)" \
-        "$(podman_state_file podman_ipv6_targets)"
+        "$(podman_state_file podman_ipv6_targets)" \
+        "$(podman_state_file podman_ipv6_uplink)" \
+        "$(podman_state_file podman_ipv6_ndp_required)"
     install_podman_ipv6_nat66_service
     _green "podman-ipv6 created (isolated ULA NAT66): IPv6=${subnet}"
     _yellow "The host has no delegable public IPv6 pool; containers retain outbound IPv6 through NAT66 and do not receive public /128 addresses"
@@ -1918,6 +1998,7 @@ create_ipv6_network() {
     _yellow "Warning: podman-ipv6 creation failed; independent IPv6 remains disabled"
     printf '%s\n' "" > "$(podman_state_file podman_ipv6_subnet)"
     set_ipv6_network_mode ""
+    rm -f "$(podman_state_file podman_ipv6_uplink)" "$(podman_state_file podman_ipv6_ndp_required)"
     rm -f "$net_err" 2>/dev/null || true
     return 1
 }
@@ -2061,16 +2142,39 @@ resolve_ndpresponder_image() {
 
 start_ndpresponder() {
     _yellow "Starting NDP responder for IPv6..."
-    local podman_socket ndp_status ndp_logs ndp_image ndp_target_file network_mode
+    local podman_socket ndp_status ndp_logs ndp_image ndp_target_file network_mode ndp_required uplink
     local -a ndp_args ndp_volume_args
     if ! podman network exists podman-ipv6 2>/dev/null; then
         _yellow "podman-ipv6 network not found, skipping ndpresponder"
         return 1
     fi
-    network_mode=$(cat "$(podman_state_file podman_ipv6_network_mode)" 2>/dev/null || true)
-    if [[ "$network_mode" == "nat" ]]; then
+    network_mode=""
+    ndp_required=""
+    if [[ -f "$(podman_state_file podman_ipv6_network_mode)" ]]; then
+        network_mode=$(tr -d '[:space:]' <"$(podman_state_file podman_ipv6_network_mode)" 2>/dev/null || true)
+    fi
+    if [[ -f "$(podman_state_file podman_ipv6_ndp_required)" ]]; then
+        ndp_required=$(tr -d '[:space:]' <"$(podman_state_file podman_ipv6_ndp_required)" 2>/dev/null || true)
+    fi
+    if [[ "$network_mode" == "nat" || "$ndp_required" == "false" ]]; then
+        if [[ "$network_mode" != "nat" ]]; then
+            _green "Podman routed IPv6 uses a non-Ethernet uplink; NDP responder is not required"
+            return 0
+        fi
         _green "Podman IPv6 uses ULA NAT66; NDP responder is not required"
         return 0
+    fi
+    if [[ "$ndp_required" != "true" ]]; then
+        _yellow "Podman IPv6 NDP state is incomplete; refusing to guess an IPv4 uplink"
+        return 1
+    fi
+    uplink=""
+    if [[ -f "$(podman_state_file podman_ipv6_uplink)" ]]; then
+        uplink=$(tr -d '[:space:]' <"$(podman_state_file podman_ipv6_uplink)" 2>/dev/null || true)
+    fi
+    if [[ -z "$uplink" ]]; then
+        _yellow "Podman IPv6 NDP state is missing its IPv6 uplink"
+        return 1
     fi
     if command -v systemctl >/dev/null 2>&1; then
         systemctl start podman.socket 2>/dev/null || true
@@ -2101,9 +2205,7 @@ start_ndpresponder() {
         ndp_args=(-N podman-ipv6)
         ndp_volume_args=()
     fi
-    if [[ -n "$interface" ]]; then
-        ndp_args=(-i "$interface" "${ndp_args[@]}")
-    fi
+    ndp_args=(-i "$uplink" "${ndp_args[@]}")
     if podman run -d \
         --restart on-failure:3 \
         --cpus 0.02 \
@@ -2346,8 +2448,10 @@ main() {
     setup_podman_socket
     setup_dns_check
     if [[ "$IPV6_ENABLED" == true ]]; then
-        adapt_ipv6
-        if create_ipv6_network "$IPV6_CIDR" && start_ndpresponder; then
+        if adapt_ipv6 && \
+           create_ipv6_network "$IPV6_CIDR" && \
+           configure_podman_ipv6_ndp_state && \
+           start_ndpresponder; then
             echo "true" > "$(podman_state_file podman_ipv6_enabled)"
         else
             echo "false" > "$(podman_state_file podman_ipv6_enabled)"

@@ -33,6 +33,12 @@ source <(extract_function generate_ipv6_subnet_candidates)
 source <(extract_function is_public_ipv6)
 # shellcheck disable=SC1090 # The test intentionally loads the CIDR selector.
 source <(extract_function select_public_ipv6_cidr)
+# shellcheck disable=SC1090 # The test intentionally loads IPv6 uplink helpers.
+source <(extract_function podman_ipv6_uplink_interface)
+# shellcheck disable=SC1090 # The test intentionally loads IPv6 uplink helpers.
+source <(extract_function podman_ipv6_uplink_supports_ndp)
+# shellcheck disable=SC1090 # The test intentionally loads IPv6 responder state setup.
+source <(extract_function configure_podman_ipv6_ndp_state)
 # shellcheck disable=SC1090 # The test intentionally loads one installer function.
 source <(extract_function normalize_ipv6_subnet)
 # shellcheck disable=SC1090 # The test intentionally loads the ULA NAT66 validator.
@@ -60,7 +66,14 @@ host_cidr="2a14:6781:000a:0000:0009:0000:0000:0000/64"
 
 # shellcheck disable=SC2329 # Invoked by the dynamically sourced IPv6 helper.
 ip() {
-    if [[ "$1" == "-6" && "$2" == "-o" && "$3" == "addr" ]]; then
+    if [[ "$1" == "-d" && "$2" == "link" ]]; then
+        case "${5:-}" in
+            he-ipv6) printf '%s\n' '5: he-ipv6: <POINTOPOINT,UP> mtu 1480 link/sit' ;;
+            *) printf '%s\n' '4: vmbr2: <BROADCAST,UP> mtu 1500 link/ether 02:00:00:00:00:01' ;;
+        esac
+    elif [[ "$1" == "link" && "$2" == "show" ]]; then
+        printf '%s\n' '4: vmbr2: <BROADCAST,UP> mtu 1500 link/ether 02:00:00:00:00:01'
+    elif [[ "$1" == "-6" && "$2" == "-o" && "$3" == "addr" ]]; then
         case "${IPV6_TEST_SCENARIO:-default}" in
             delegated)
                 printf '%s\n' '2: vmbr0 inet6 2a14:7c0:1002:10f8::1/128 scope global'
@@ -68,6 +81,12 @@ ip() {
                 ;;
             tunnel)
                 printf '%s\n' '5: he-ipv6 inet6 2001:470:1f14:9::2/64 scope global'
+                ;;
+            narrow120)
+                printf '%s\n' '2: eth0 inet6 2a14:6781:a::9/120 scope global'
+                ;;
+            narrow127)
+                printf '%s\n' '2: eth0 inet6 2a14:6781:a::8/127 scope global'
                 ;;
             hostonly)
                 printf '%s\n' '2: eth0 inet6 2a14:6781:000a:0000::9/128 scope global'
@@ -97,10 +116,50 @@ if [[ "$selected" != '2001:470:1f14:9::2/64' ]]; then
     printf 'tunnel /64 selection returned %q\n' "$selected" >&2
     exit 1
 fi
+uplink=$(podman_ipv6_uplink_interface)
+if [[ "$uplink" != 'he-ipv6' ]]; then
+    printf 'tunnel IPv6 uplink detection returned %q\n' "$uplink" >&2
+    exit 1
+fi
+if podman_ipv6_uplink_supports_ndp "$uplink"; then
+    printf 'non-Ethernet tunnel was incorrectly marked as requiring NDP\n' >&2
+    exit 1
+fi
 IPV6_TEST_SCENARIO=hostonly
 selected=$(select_public_ipv6_cidr)
 if [[ "$selected" != '2a14:6781:000a:0000::9/128' ]]; then
     printf 'host-only /128 selection returned %q\n' "$selected" >&2
+    exit 1
+fi
+IPV6_TEST_SCENARIO=delegated
+uplink=$(podman_ipv6_uplink_interface)
+if [[ "$uplink" != 'vmbr2' ]] || ! podman_ipv6_uplink_supports_ndp "$uplink"; then
+    printf 'PVE delegated IPv6 uplink was not recognized as Ethernet: %q\n' "$uplink" >&2
+    exit 1
+fi
+printf '%s\n' manual >"$(podman_state_file podman_ipv6_network_mode)"
+IPV6_TEST_SCENARIO=tunnel
+if ! configure_podman_ipv6_ndp_state || \
+   [[ "$(tr -d '[:space:]' <"$(podman_state_file podman_ipv6_ndp_required)")" != false ]]; then
+    printf 'tunnel IPv6 incorrectly required a Podman NDP responder\n' >&2
+    exit 1
+fi
+IPV6_TEST_SCENARIO=delegated
+if ! configure_podman_ipv6_ndp_state || \
+   [[ "$(tr -d '[:space:]' <"$(podman_state_file podman_ipv6_ndp_required)")" != true ]]; then
+    printf 'PVE Ethernet IPv6 did not require a Podman NDP responder\n' >&2
+    exit 1
+fi
+IPV6_TEST_SCENARIO=narrow120
+selected=$(select_public_ipv6_cidr)
+if [[ "$selected" != '2a14:6781:a::9/120' ]]; then
+    printf 'routed /120 selection returned %q\n' "$selected" >&2
+    exit 1
+fi
+IPV6_TEST_SCENARIO=narrow127
+selected=$(select_public_ipv6_cidr)
+if [[ "$selected" != '2a14:6781:a::8/127' ]]; then
+    printf 'routed /127 selection returned %q\n' "$selected" >&2
     exit 1
 fi
 unset IPV6_TEST_SCENARIO
@@ -204,8 +263,21 @@ if extract_function check_ipv6 | grep -Eq 'API_NET|curl[[:space:]]'; then
     printf 'check_ipv6 must not use an external address as a subnet source\n' >&2
     exit 1
 fi
-if ! extract_function adapt_ipv6 | grep -Fq "net.ipv6.conf.\${interface}.accept_ra=2"; then
+if ! extract_function adapt_ipv6 | grep -Fq "net.ipv6.conf.\${uplink}.accept_ra=2"; then
     printf 'Podman IPv6 forwarding must preserve router advertisements on the uplink\n' >&2
+    exit 1
+fi
+if extract_function adapt_ipv6 | grep -Eq 'update_sysctl[[:space:]].*proxy_ndp'; then
+    printf 'Podman IPv6 setup must not change global proxy_ndp state\n' >&2
+    exit 1
+fi
+if ! grep -Fq '["ip", "-6", "route", "show", "default"]' "$installer"; then
+    printf 'Podman routed IPv6 allocation must reserve the upstream default gateway\n' >&2
+    exit 1
+fi
+if ! grep -Fq 'podman_ipv6_ndp_required' "$repo_root/scripts/onepodman.sh" || \
+   ! grep -Fq 'NDP responder is not required' "$repo_root/scripts/onepodman.sh"; then
+    printf 'Podman tunnel/non-Ethernet IPv6 still requires an NDP responder\n' >&2
     exit 1
 fi
 if ! ndpresponder_image_matches_architecture arm64 arm64 ||
@@ -455,7 +527,15 @@ fi
     printf 'Podman NAT66 attempted to open the API socket\n' >&2
     exit 1
 }
+printf '%s\n' manual >"$(podman_state_file podman_ipv6_network_mode)"
+printf '%s\n' false >"$(podman_state_file podman_ipv6_ndp_required)"
+if ! start_ndpresponder; then
+    printf 'Podman tunnel IPv6 unnecessarily required ndpresponder\n' >&2
+    exit 1
+fi
 printf '%s\n' '' >"$(podman_state_file podman_ipv6_network_mode)"
+printf '%s\n' true >"$(podman_state_file podman_ipv6_ndp_required)"
+printf '%s\n' eth0 >"$(podman_state_file podman_ipv6_uplink)"
 # shellcheck disable=SC2329 # Invoked by the dynamically sourced installer function.
 _yellow() { :; }
 # shellcheck disable=SC2034 # Read by the dynamically sourced installer function.
@@ -621,6 +701,16 @@ create_ipv6_network "$delegated_cidr"
     printf 'delegated /38 attempted managed Podman IPv6 instead of manual routing\n' >&2
     exit 1
 }
+for short_parent in '2a14:6781:a::9/120' '2a14:6781:a::8/127'; do
+    captured_manual_parent=''
+    manual_fallback_called=false
+    managed_attempted=false
+    create_ipv6_network "$short_parent"
+    [[ "$captured_manual_parent" == "$short_parent" && "$manual_fallback_called" == true ]] || {
+        printf 'short routed parent was not preserved for manual Podman IPv6: %q\n' "$short_parent" >&2
+        exit 1
+    }
+done
 if ! grep -Fq 'net_opts="--network podman-net --network podman-ipv6"' "$repo_root/scripts/onepodman.sh"; then
     printf 'unmanaged IPv6 containers must attach podman-net before podman-ipv6\n' >&2
     exit 1

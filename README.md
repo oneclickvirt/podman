@@ -223,11 +223,11 @@ bash <(wget -qO- https://raw.githubusercontent.com/oneclickvirt/podman/main/podm
 ## 网络说明
 
 - IPv4 网络名: `podman-net`，bridge: `podman-br0`，subnet: `172.20.0.0/16`
-- IPv6 网络名: `podman-ipv6`，bridge: `podman-br1`。安装器只使用宿主机本地绑定的公网 IPv6 CIDR，不会把外部出口 API 返回的单个地址伪造成可分配网段。
-- 安装器会从宿主机前缀中选择不包含宿主地址的更小 sibling 子网。若 Netavark 因该子网仍与宿主机已绑定 `/64` 重叠而拒绝创建，安装器会创建并持久化自己拥有的 `mode=unmanaged` IPv6 bridge。
-- 在 `mode=unmanaged` 回退中，容器会同时接入 `podman-net` 与 `podman-ipv6`：前者保留 IPv4 NAT、`-p` 端口映射和 IPv4 默认路由；后者提供独立 IPv6，并显式添加 IPv6 默认路由而不新增 IPv4 默认路由。若 IPv6 网络或 NDP responder 未通过健康检查，创建脚本会自动仅使用 IPv4 网络。
-- `mode=unmanaged` 遵循 Netavark 的语义，不会为 IPv6 建立 NAT 或端口转发；公网 IPv6 直接路由到容器。若宿主机有默认拒绝的防火墙策略，需允许上联网卡与 `podman-br1` 之间对该 IPv6 子网的转发；IPv4 的 `-p` 端口映射仍由 `podman-net` 提供。
-- NDP responder 通过 Podman 的 Docker 兼容 API socket 跟踪 `podman-ipv6` 地址；它会在启动时验证 socket 和网络查询，失败或 responder 未运行时，IPv6 启用状态不会写为成功。
+- IPv6 网络名: `podman-ipv6`，bridge: `podman-br1`。安装器只使用宿主机本地绑定的公网 IPv6 CIDR，不会把外部出口 API 返回的单个地址伪造成可分配网段；多个地址同时存在时会优先选择可分配的较大前缀，例如 PVE 的委派 `/38` 不会被上联 `/128` 遮蔽。
+- 安装器会从宿主机前缀中选择不包含宿主地址的更小 sibling 子网。若 Netavark 因 SLAAC 或其他宿主路由重叠而拒绝公网子网，会改用 `mode=manual`：CNI 侧使用隔离 ULA，容器启动后由安装器将公网父前缀中的独立 `/128` 路由到容器，不会再次把重叠网段交给 Netavark。
+- 只有单个公网 `/128`、过窄前缀或手动路由模式不可用时，会改用 `mode=nat` 的 ULA NAT66。该模式保留容器 IPv6 出站，但不会承诺可从互联网直连的公网 `/128`。
+- 手动路由和已有的 `mode=unmanaged` 网络会同时保留 `podman-net` 的 IPv4 NAT、`-p` 端口映射及 IPv4 默认路由；IPv6 网络只提供 IPv6 路由。公网 IPv6 不做 NAT 或 IPv6 端口转发，默认拒绝的防火墙需允许上联网卡与 `podman-br1` 间的 IPv6 转发。
+- NDP responder 只在实际 IPv6 上联是以太网且需要邻居发现时启动，通过 Podman 的 Docker 兼容 API socket 跟踪 `podman-ipv6` 地址。NAT66 与 SIT、6in4、ip6tnl 等非以太网隧道不依赖 responder，创建容器时不会因其未运行而退回 IPv4。
 - 与 containerd/docker 版本完全隔离，互不干扰
 
 ## 与 containerd/docker 版本对比
