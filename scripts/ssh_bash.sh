@@ -2,6 +2,7 @@
 # from
 # https://github.com/oneclickvirt/podman
 # 2026.08.28
+# oneclickvirt-ssh-init-revision: 20260828.2
 
 # 容器内 SSH 初始化脚本（适用于 bash 系统：Debian/Ubuntu/AlmaLinux/RockyLinux/OpenEuler）
 
@@ -141,11 +142,33 @@ fix_cloud_init() {
     fi
 }
 
+# A container image may use "exec sshd -D" as its entrypoint. Restarting that
+# service kills PID 1 and therefore stops the whole container. Reloading the
+# validated PID 1 process keeps the container and existing SSH sessions alive.
+sshd_runs_as_pid1() {
+    [ "$(cat /proc/1/comm 2>/dev/null)" = "sshd" ]
+}
+
+reload_pid1_sshd() {
+    if ! /usr/sbin/sshd -t 2>/dev/null; then
+        echo "sshd configuration validation failed; keeping PID 1 unchanged" >&2
+        return 1
+    fi
+    if ! kill -HUP 1 2>/dev/null; then
+        echo "failed to reload PID 1 sshd" >&2
+        return 1
+    fi
+}
+
 # ======== 生成并启动 sshd ========
 start_sshd() {
     cd /etc/ssh || true
     ssh-keygen -A 2>/dev/null || true
     mkdir -p /var/run/sshd
+    if sshd_runs_as_pid1; then
+        reload_pid1_sshd
+        return $?
+    fi
     if command -v systemctl >/dev/null 2>&1; then
         systemctl enable ssh 2>/dev/null || systemctl enable sshd 2>/dev/null || true
         systemctl restart ssh 2>/dev/null || systemctl restart sshd 2>/dev/null || true
@@ -183,7 +206,10 @@ update_sshd_config
 printf "%s\n" "root:${passwd_input}" | chpasswd 2>/dev/null || \
     printf "%s\n" "root:${passwd_input}" | sudo chpasswd 2>/dev/null || true
 
-start_sshd
+if ! start_sshd; then
+    echo "SSH initialization failed" >&2
+    exit 1
+fi
 setup_cron_sshd
 
 echo "SSH initialization completed"

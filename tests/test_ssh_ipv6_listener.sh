@@ -25,4 +25,15 @@ for file in "${files[@]}"; do
     fi
 done
 
+for file in "$repo_root/scripts/ssh_bash.sh" "$repo_root/scripts/ssh_sh.sh"; do
+    if ! grep -Fq 'oneclickvirt-ssh-init-revision:' "$file"; then
+        printf 'missing SSH script revision marker: %s\n' "$file" >&2
+        exit 1
+    fi
+    if ! grep -Fq '/proc/1/comm' "$file" || ! grep -Fq 'kill -HUP 1' "$file"; then
+        printf 'PID 1 sshd reload guard is missing: %s\n' "$file" >&2
+        exit 1
+    fi
+done
+
 printf '%s\n' 'SSH dual-stack listener regression checks passed'

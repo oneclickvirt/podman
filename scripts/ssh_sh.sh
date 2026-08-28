@@ -2,6 +2,7 @@
 # from
 # https://github.com/oneclickvirt/podman
 # 2026.08.28
+# oneclickvirt-ssh-init-revision: 20260828.2
 
 # 容器内 SSH 初始化脚本（仅适用于 Alpine Linux）
 
@@ -81,9 +82,28 @@ mkdir -p /var/run/sshd
 # 设置 root 密码
 printf "%s\n" "root:${passwd_input}" | chpasswd 2>/dev/null || true
 
-# 启动 sshd
-rc-update add sshd default 2>/dev/null || true
-/usr/sbin/sshd 2>/dev/null || true
+# 当镜像入口将 sshd 作为 PID 1 时，启动第二个 sshd 会因端口已被占用而失败。
+# 配置校验通过后 HUP 重载 PID 1，避免 service restart 终止整个容器。
+start_sshd() {
+    if [ "$(cat /proc/1/comm 2>/dev/null)" = "sshd" ]; then
+        if ! /usr/sbin/sshd -t 2>/dev/null; then
+            echo "sshd configuration validation failed; keeping PID 1 unchanged" >&2
+            return 1
+        fi
+        kill -HUP 1 2>/dev/null || {
+            echo "failed to reload PID 1 sshd" >&2
+            return 1
+        }
+        return 0
+    fi
+    rc-update add sshd default 2>/dev/null || true
+    /usr/sbin/sshd 2>/dev/null
+}
+
+if ! start_sshd; then
+    echo "SSH initialization failed" >&2
+    exit 1
+fi
 
 # 设置 cron 保活
 cron_line="* * * * * pgrep -x sshd>/dev/null||/usr/sbin/sshd"
