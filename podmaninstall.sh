@@ -1,7 +1,7 @@
 #!/bin/bash
 # from
 # https://github.com/oneclickvirt/podman
-# 2026.08.27
+# 2026.08.28
 _red()    { echo -e "\033[31m\033[01m$*\033[0m"; }
 _green()  { echo -e "\033[32m\033[01m$*\033[0m"; }
 _yellow() { echo -e "\033[33m\033[01m$*\033[0m"; }
@@ -715,6 +715,65 @@ install_podman() {
         exit 1
     fi
 }
+
+# Podman can run without aardvark-dns when every network uses --disable-dns,
+# but the missing helper makes ordinary bridge creation noisy and leaves
+# container name resolution disabled.  Install the companion packages even
+# when Podman was already present (common on provider images), while keeping
+# the install non-fatal on distributions that do not publish them.
+podman_network_binary_available() {
+    case "${1:-}" in
+        netavark)
+            command -v netavark >/dev/null 2>&1 ||
+                [[ -x /usr/lib/podman/netavark || -x /usr/libexec/podman/netavark ]]
+            ;;
+        aardvark)
+            command -v aardvark-dns >/dev/null 2>&1 ||
+                [[ -x /usr/lib/podman/aardvark-dns || -x /usr/libexec/podman/aardvark-dns || -x /usr/libexec/netavark/aardvark-dns ]]
+            ;;
+        *) return 1 ;;
+    esac
+}
+
+install_podman_network_dependencies() {
+    local package
+    case "$SYSTEM" in
+        Debian|Ubuntu)
+            for package in netavark aardvark-dns; do
+                apt-get -y install "$package" 2>/dev/null || true
+            done
+            ;;
+        CentOS|Fedora)
+            for package in netavark aardvark-dns; do
+                if command -v dnf >/dev/null 2>&1; then
+                    dnf install -y "$package" 2>/dev/null || true
+                else
+                    yum -y install "$package" 2>/dev/null || true
+                fi
+            done
+            ;;
+        Alpine)
+            for package in netavark aardvark-dns; do
+                apk add --no-cache "$package" 2>/dev/null || true
+            done
+            ;;
+        Arch)
+            pacman -Sy --noconfirm netavark aardvark-dns 2>/dev/null || true
+            ;;
+    esac
+
+    if podman_network_binary_available netavark; then
+        _green "Netavark network backend is available"
+    else
+        _yellow "Warning: netavark binary not found; Podman network creation may fail"
+    fi
+    if podman_network_binary_available aardvark; then
+        _green "aardvark-dns is available"
+    else
+        _yellow "Warning: aardvark-dns binary not found; DNS will be disabled for networks without an explicit DNS backend"
+    fi
+}
+
 # ======== 配置 Podman 存储 ========
 configure_podman_storage() {
     _yellow "Configuring Podman storage..."
@@ -1534,6 +1593,12 @@ PY
 }
 replace_mapping() {
     local name="$1" address="$2" tmp
+    if awk -v name="$name" -v address="$address" '$1 == name && $2 == address {found=1} END {exit found ? 0 : 1}' "$map_file" 2>/dev/null; then
+        # Keep the target file in sync, but avoid rewriting the allocation map
+        # on every watch iteration when nothing changed.
+        sync_targets
+        return $?
+    fi
     tmp=$(mktemp "${map_file}.tmp.XXXXXX") || return 1
     awk -v name="$name" '$1 != name {print}' "$map_file" 2>/dev/null >"$tmp" || true
     printf '%s %s\n' "$name" "$address" >>"$tmp"
@@ -1546,6 +1611,10 @@ sync_targets() {
     tmp=$(mktemp "${target_file}.tmp.XXXXXX") || return 1
     awk 'NF >= 2 {print $2 "/128"}' "$map_file" | sort -u >"$tmp"
     chmod 644 "$tmp"
+    if [[ -f "$target_file" ]] && cmp -s "$tmp" "$target_file"; then
+        rm -f "$tmp"
+        return 0
+    fi
     # ndpresponder consumes this through a file bind mount. Replacing the
     # path would leave the container attached to the old inode, so update the
     # existing file in place after the complete replacement was prepared.
@@ -1592,6 +1661,19 @@ attach_one_locked() {
     valid_ipv6_in_parent "$address" "$parent" || return 1
     iface=$(find_container_iface "$name" "$pid")
     [[ -n "$iface" ]] || { printf 'Unable to find the IPv6 network interface for %s\n' "$name" >&2; return 1; }
+
+    # A long-running restore watcher must be idempotent.  Check the three
+    # externally visible postconditions before issuing namespace and route
+    # mutations; this keeps a stable container from consuming CPU and filling
+    # the kernel route transaction log every few seconds.
+    if [[ -n "$address" ]] && \
+       nsenter -t "$pid" -n ip -o -6 addr show dev "$iface" 2>/dev/null | awk -v wanted="$address/128" '$4 == wanted {found=1} END {exit found ? 0 : 1}' && \
+       nsenter -t "$pid" -n ip -6 route show default 2>/dev/null | awk -v gateway="$gateway" -v device="$iface" '$0 ~ ("via " gateway " ") && $0 ~ ("dev " device "([[:space:]]|$)") {found=1} END {exit found ? 0 : 1}' && \
+       ip -6 route show "$address/128" dev "$bridge" 2>/dev/null | grep -Fq "$address/128"; then
+        replace_mapping "$name" "$address" || return 1
+        printf '%s\n' "$address"
+        return 0
+    fi
     nsenter -t "$pid" -n ip link set "$iface" up || return 1
     nsenter -t "$pid" -n ip -6 addr replace "$address/128" dev "$iface" || return 1
     nsenter -t "$pid" -n ip -6 route replace default via "$gateway" dev "$iface" || return 1
@@ -1656,8 +1738,8 @@ restore_all() {
 }
 
 watch_all() {
-    local interval="${PODMAN_IPV6_WATCH_INTERVAL:-2}"
-    [[ "$interval" =~ ^[1-9][0-9]*$ ]] || interval=2
+    local interval="${PODMAN_IPV6_WATCH_INTERVAL:-5}"
+    [[ "$interval" =~ ^[1-9][0-9]*$ ]] || interval=5
     while :; do
         restore_all || true
         sleep "$interval"
@@ -1884,9 +1966,10 @@ create_ipv6_network() {
             install_podman_ipv6_nat66_service
             _green "Reusing installer-managed Podman ULA NAT66 network: ${network_subnet}"
         elif [[ "$managed_error" == "manual" ]] || [[ -s "$(podman_state_file podman_ipv6_public_prefix)" && -s "$(podman_state_file podman_ipv6_manual_subnet)" ]]; then
-            if [[ ! -x /usr/local/bin/podman-ipv6-attach.sh ]]; then
-                install_manual_ipv6_attach_helper
-            fi
+            # The helper owns the restore loop and is updated independently of
+            # the network shape. Refresh it on every installer rerun so an
+            # existing manual network receives CPU/idempotency fixes too.
+            install_manual_ipv6_attach_helper
             install_manual_ipv6_restore_service
             set_ipv6_network_mode manual
         elif [[ "$managed_error" == "unmanaged" ]]; then
@@ -2335,7 +2418,7 @@ main() {
     _blue "======================================================"
     _blue "  Podman 容器运行时一键安装脚本"
     _blue "  from https://github.com/oneclickvirt/podman"
-    _blue "  2026.08.26"
+    _blue "  2026.08.28"
     _blue "======================================================"
     echo
     # 重新计算 int（系统类型索引）
@@ -2444,6 +2527,7 @@ main() {
         fi
     fi
     install_podman
+    install_podman_network_dependencies
     configure_podman_storage
     configure_kernel
     configure_rootless_user

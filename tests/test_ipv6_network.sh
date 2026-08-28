@@ -780,4 +780,18 @@ if ensure_unmanaged_ipv6_bridge '2a14:6781:a:0:2::/96' '2a14:6781:a:0:2::1'; the
     exit 1
 fi
 
+# A rerun against an existing manual network must regenerate the attach helper;
+# otherwise a machine that installed an older release keeps its tight restore
+# loop indefinitely even after the installer has been updated.
+manual_existing_branch=$(extract_function create_ipv6_network | awk '
+    /elif \[\[ "\$managed_error" == "manual" \]\]/ { in_branch = 1 }
+    in_branch { print }
+    in_branch && /elif \[\[ "\$managed_error" == "unmanaged" \]\]/ { exit }
+')
+if [[ "$manual_existing_branch" == *'[[ ! -x /usr/local/bin/podman-ipv6-attach.sh ]]'* ]] || \
+   [[ "$manual_existing_branch" != *'install_manual_ipv6_attach_helper'* ]]; then
+    printf 'existing manual Podman IPv6 networks do not refresh the attach helper\n' >&2
+    exit 1
+fi
+
 printf 'podman IPv6 network candidate tests passed\n'
