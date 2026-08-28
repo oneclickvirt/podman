@@ -1,7 +1,7 @@
 #!/bin/sh
 # from
 # https://github.com/oneclickvirt/podman
-# 2026.03.01
+# 2026.08.28
 
 # 容器内 SSH 初始化脚本（仅适用于 Alpine Linux）
 
@@ -59,11 +59,14 @@ if [ -f "$config_file" ]; then
     set_sshd_option "$config_file" "PasswordAuthentication" "yes"
     set_sshd_option "$config_file" "PubkeyAuthentication" "yes"
     set_sshd_option "$config_file" "Port" "22"
-    if grep -qE '^#?ListenAddress[[:space:]]+0\.0\.0\.0' "$config_file"; then
-        sed -i 's/^#\?ListenAddress[[:space:]]\+0\.0\.0\.0/ListenAddress 0.0.0.0/' "$config_file"
-    else
-        echo "ListenAddress 0.0.0.0" >> "$config_file"
-    fi
+    for file in "$config_file" "${config_dir}"*; do
+        [ -f "$file" ] || continue
+        sed -E -i \
+            -e '/^[[:space:]]*#/!s/^[[:space:]]*AddressFamily[[:space:]]+.*/# &/' \
+            -e '/^[[:space:]]*#/!s/^[[:space:]]*ListenAddress[[:space:]]+.*/# &/' \
+            "$file"
+    done
+    printf '\nAddressFamily any\n' >> "$config_file"
 fi
 
 # 修复 cloud-init

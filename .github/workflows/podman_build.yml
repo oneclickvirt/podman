@@ -53,6 +53,7 @@ jobs:
           # statically trace on the Ubuntu runner.
           shellcheck -e SC2317 tests/test_ipv6_network.sh
           bash tests/test_ipv6_network.sh
+          bash tests/test_ssh_ipv6_listener.sh
 
   build:
     name: Build ${{ matrix.os }} (${{ matrix.arch }})

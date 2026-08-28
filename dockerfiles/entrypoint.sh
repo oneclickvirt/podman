@@ -33,6 +33,14 @@ if [ -f "$sshd_cfg" ]; then
     else
         echo "PasswordAuthentication yes" >> "$sshd_cfg"
     fi
+    for file in "$sshd_cfg" "${config_dir}"*; do
+        [ -f "$file" ] || continue
+        sed -E -i \
+            -e '/^[[:space:]]*#/!s/^[[:space:]]*AddressFamily[[:space:]]+.*/# &/' \
+            -e '/^[[:space:]]*#/!s/^[[:space:]]*ListenAddress[[:space:]]+.*/# &/' \
+            "$file"
+    done
+    printf '\nAddressFamily any\n' >> "$sshd_cfg"
 fi
 
 # 修复 cloud-init 密码禁用策略

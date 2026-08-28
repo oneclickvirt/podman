@@ -1,7 +1,7 @@
 #!/bin/bash
 # from
 # https://github.com/oneclickvirt/podman
-# 2026.03.01
+# 2026.08.28
 
 # 容器内 SSH 初始化脚本（适用于 bash 系统：Debian/Ubuntu/AlmaLinux/RockyLinux/OpenEuler）
 
@@ -94,6 +94,24 @@ set_sshd_option() {
     fi
 }
 
+enable_sshd_dual_stack() {
+    local config_file="$1"
+    local config_dir="$2"
+    local file
+
+    # Explicit IPv4-only listeners silently make a routed public IPv6 unusable.
+    # Disable inherited listener/family overrides, then make the primary config
+    # bind both address families on the standard SSH port.
+    for file in "$config_file" "${config_dir}"*; do
+        [ -f "$file" ] || continue
+        sed -E -i \
+            -e '/^[[:space:]]*#/!s/^[[:space:]]*AddressFamily[[:space:]]+.*/# &/' \
+            -e '/^[[:space:]]*#/!s/^[[:space:]]*ListenAddress[[:space:]]+.*/# &/' \
+            "$file"
+    done
+    printf '\nAddressFamily any\n' >> "$config_file"
+}
+
 update_sshd_config() {
     local config_file="/etc/ssh/sshd_config"
     local config_dir="/etc/ssh/sshd_config.d/"
@@ -111,11 +129,7 @@ update_sshd_config() {
     set_sshd_option "$config_file" "PasswordAuthentication" "yes"
     set_sshd_option "$config_file" "PubkeyAuthentication" "yes"
     set_sshd_option "$config_file" "UsePAM" "yes"
-    if grep -qE '^#?ListenAddress[[:space:]]+0\.0\.0\.0' "$config_file"; then
-        sed -i 's/^#\?ListenAddress[[:space:]]\+0\.0\.0\.0/ListenAddress 0.0.0.0/' "$config_file"
-    else
-        echo "ListenAddress 0.0.0.0" >> "$config_file"
-    fi
+    enable_sshd_dual_stack "$config_file" "$config_dir"
 }
 
 # ======== 修复 cloud-init ========

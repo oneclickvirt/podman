@@ -52,3 +52,4 @@ jobs:
           set -euo pipefail
           bash tests/test_ipv6_network.sh
           bash tests/test_btrfs_disk_limit.sh
+          bash tests/test_ssh_ipv6_listener.sh
