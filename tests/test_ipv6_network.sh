@@ -54,6 +54,10 @@ eval "$(extract_function ndpresponder_image_matches_architecture)"
 # shellcheck disable=SC1090 # The test intentionally loads one installer helper.
 eval "$(extract_function ndpresponder_supports_target_file)"
 # shellcheck disable=SC1090 # The test intentionally loads one installer helper.
+eval "$(extract_function ndpresponder_supports_ready_file)"
+# shellcheck disable=SC1090 # The test intentionally loads one installer helper.
+eval "$(extract_function ndpresponder_supports_manual_routed_features)"
+# shellcheck disable=SC1090 # The test intentionally loads one installer helper.
 eval "$(extract_function ndpresponder_image_supports_required_features)"
 # shellcheck disable=SC1090 # The test intentionally loads one installer helper.
 eval "$(extract_function ndpresponder_existing_container_image)"
@@ -96,12 +100,22 @@ ip() {
                 ;;
         esac
     elif [[ "$1" == "-6" && "$2" == "route" ]]; then
+        if [[ "${IPV6_TEST_SCENARIO:-default}" == delegated ]]; then
+            # The management /128 uses the default route, while the
+            # delegated /38 is carried by a separate PVE bridge.
+            printf '%s\n' 'default via fe80::1 dev eth0 proto ra metric 1024'
+        fi
         printf '%s\n' '2605:52c0:2:14b::/64 dev eth0 proto kernel'
     fi
 }
 selected=$(select_public_ipv6_cidr)
 if [[ "$selected" != '2605:52c0:2:14b:be24:11ff:fe6e:d967/64' ]]; then
     printf 'normal /64 selection returned %q\n' "$selected" >&2
+    exit 1
+fi
+uplink=$(podman_ipv6_uplink_interface)
+if [[ "$uplink" != eth0 ]]; then
+    printf 'normal /64 uplink detection returned %q\n' "$uplink" >&2
     exit 1
 fi
 IPV6_TEST_SCENARIO=delegated
@@ -291,33 +305,68 @@ if ! extract_function start_ndpresponder | grep -Fq -- '--restart on-failure:3';
     printf 'ndpresponder must use a bounded failure restart policy\n' >&2
     exit 1
 fi
+if ! grep -Fq 'podman_ipv6_ndp_ready_required' "$repo_root/scripts/onepodman.sh"; then
+    printf 'Podman container creation must honor the NDP responder readiness state\n' >&2
+    exit 1
+fi
 if extract_function start_ndpresponder | grep -Fq -- '--restart always'; then
     printf 'ndpresponder must not use an unconditional restart policy\n' >&2
     exit 1
 fi
 
-# A stale image must be rejected when manual routed mode needs the hot-reloaded
-# target file. The probe is deliberately isolated from the later Podman mocks.
+# A stale image must be rejected when manual routed mode needs a hot-reloaded
+# target file and an explicit readiness marker. The probe is deliberately
+# isolated from the later Podman mocks.
 if ! (
     # shellcheck disable=SC2329 # Invoked by the dynamically sourced capability probe.
     podman() {
         [[ "${1:-}" == run ]] || return 1
         printf '%s\n' '      --target-file value  reloadable static targets'
+        printf '%s\n' '      --target-file-reload-interval value  target refresh interval'
+        printf '%s\n' '      --ready-file value  responder readiness marker'
     }
-    ndpresponder_supports_target_file stale-image
+    ndpresponder_supports_manual_routed_features compatible-image
 ); then
-    printf 'target-file capability probe rejected a compatible image\n' >&2
+    printf 'manual routed capability probe rejected a compatible image\n' >&2
     exit 1
 fi
 if (
     # shellcheck disable=SC2329 # Invoked by the dynamically sourced capability probe.
     podman() {
         [[ "${1:-}" == run ]] || return 1
-        printf '%s\n' '      -n value  static targets'
+        printf '%s\n' '      --target-file value  reloadable static targets'
     }
-    ndpresponder_supports_target_file stale-image
+    ndpresponder_supports_manual_routed_features stale-image
 ); then
-    printf 'target-file capability probe accepted a stale image\n' >&2
+    printf 'manual routed capability probe accepted a stale image\n' >&2
+    exit 1
+fi
+
+# Managed IPv6 does not use target-file, but it still passes --ready-file.
+# Rejecting a legacy image here prevents the restart loop caused by an unknown
+# flag on an otherwise architecture-compatible registry tag.
+if ! (
+    # shellcheck disable=SC2329 # Invoked by the dynamically sourced capability probe.
+    podman() {
+        [[ "${1:-}" == run ]] || return 1
+        printf '%s\n' '      --ready-file value  responder readiness marker'
+    }
+    NDPRESPONDER_TARGET_FILE_REQUIRED=false
+    ndpresponder_image_supports_required_features managed-compatible-image
+); then
+    printf 'managed NDP capability probe rejected a ready-file-compatible image\n' >&2
+    exit 1
+fi
+if (
+    # shellcheck disable=SC2329 # Invoked by the dynamically sourced capability probe.
+    podman() {
+        [[ "${1:-}" == run ]] || return 1
+        printf '%s\n' 'Usage: ndpresponder -i IFACE'
+    }
+    NDPRESPONDER_TARGET_FILE_REQUIRED=false
+    ndpresponder_image_supports_required_features legacy-managed-image
+); then
+    printf 'managed NDP capability probe accepted an image without ready-file support\n' >&2
     exit 1
 fi
 
@@ -340,7 +389,7 @@ podman() {
             return 0
             ;;
         run:--rm)
-            printf '%s\n' '      -n value  static targets'
+            printf '%s\n' '      --target-file value  reloadable static targets'
             return 0
             ;;
         update:--restart=no)
@@ -553,6 +602,12 @@ podman() {
         network:exists|pull:*)
             return 0
             ;;
+        run:--rm)
+            printf '%s\n' '      --target-file value  reloadable static targets'
+            printf '%s\n' '      --target-file-reload-interval value  target refresh interval'
+            printf '%s\n' '      --ready-file value  responder readiness marker'
+            return 0
+            ;;
         image:inspect)
             printf '%s\n' amd64
             return 0
@@ -606,11 +661,16 @@ podman() {
             [[ "$*" == *"$NDPRESPONDER_SOURCE_URL"* ]]
             return
             ;;
+        run:--rm)
+            printf '%s\n' '      --ready-file value  responder readiness marker'
+            return 0
+            ;;
         rm:*)
             podman_rm_called=true
             return 0
             ;;
         run:*)
+            printf '%s\n' eth0 >"$(podman_state_file podman_ipv6_ndp_ready)"
             return 0
             ;;
         inspect:-f)

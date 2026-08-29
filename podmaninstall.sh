@@ -1,7 +1,7 @@
 #!/bin/bash
 # from
 # https://github.com/oneclickvirt/podman
-# 2026.08.28
+# 2026.08.30
 _red()    { echo -e "\033[31m\033[01m$*\033[0m"; }
 _green()  { echo -e "\033[32m\033[01m$*\033[0m"; }
 _yellow() { echo -e "\033[33m\033[01m$*\033[0m"; }
@@ -506,11 +506,24 @@ select_public_ipv6_cidr() {
     printf '%s\n' "$best_cidr"
 }
 
-# The IPv6 default route identifies the NDP-facing uplink more reliably than
-# the IPv4 default route. Fall back to the complete selected CIDR so delegated
-# PVE bridges are not hidden by a separate /128 on another interface.
+# Prefer the interface that owns the selected public CIDR. A PVE host can have
+# a management /128 and a delegated /38 on different bridges while its IPv6
+# default route still points at the management bridge. Only fall back to the
+# default route when the selected CIDR cannot be mapped to a live interface.
 podman_ipv6_uplink_interface() {
-    local uplink selected
+    local uplink selected selected_if
+    selected="${IPV6_CIDR:-}"
+    if [[ "$selected" != */* ]]; then
+        selected=$(select_public_ipv6_cidr 2>/dev/null || true)
+    fi
+    if [[ "$selected" == */* ]]; then
+        selected_if=$(ip -6 -o addr show scope global 2>/dev/null | awk -v cidr="$selected" '$4 == cidr {print $2; exit}')
+        if [[ -n "$selected_if" ]] && ip link show dev "$selected_if" >/dev/null 2>&1; then
+            printf '%s\n' "$selected_if"
+            return 0
+        fi
+    fi
+
     uplink=$(ip -6 route show default 2>/dev/null | awk '
         /^default / {
             for (i = 1; i < NF; i++) {
@@ -526,11 +539,7 @@ podman_ipv6_uplink_interface() {
         return 0
     fi
 
-    selected=$(select_public_ipv6_cidr 2>/dev/null || true)
-    [[ "$selected" == */* ]] || return 1
-    uplink=$(ip -6 -o addr show scope global 2>/dev/null | awk -v cidr="$selected" '$4 == cidr {print $2; exit}')
-    [[ -n "$uplink" ]] || return 1
-    printf '%s\n' "$uplink"
+    return 1
 }
 
 podman_ipv6_uplink_supports_ndp() {
@@ -559,6 +568,11 @@ configure_podman_ipv6_ndp_state() {
     fi
     printf '%s\n' "$uplink" > "$(podman_state_file podman_ipv6_uplink)"
     printf '%s\n' "$ndp_required" > "$(podman_state_file podman_ipv6_ndp_required)"
+    if [[ "$ndp_required" != true ]]; then
+        rm -f \
+            "$(podman_state_file podman_ipv6_ndp_ready)" \
+            "$(podman_state_file podman_ipv6_ndp_ready_required)"
+    fi
     return 0
 }
 
@@ -1880,6 +1894,8 @@ create_podman_nat66_ipv6_network() {
         "$(podman_state_file podman_ipv6_manual_bridge)" \
         "$(podman_state_file podman_ipv6_allocations)" \
         "$(podman_state_file podman_ipv6_targets)" \
+        "$(podman_state_file podman_ipv6_ndp_ready)" \
+        "$(podman_state_file podman_ipv6_ndp_ready_required)" \
         "$(podman_state_file podman_ipv6_uplink)" \
         "$(podman_state_file podman_ipv6_ndp_required)"
     install_podman_ipv6_nat66_service
@@ -2084,7 +2100,11 @@ create_ipv6_network() {
     _yellow "Warning: podman-ipv6 creation failed; independent IPv6 remains disabled"
     printf '%s\n' "" > "$(podman_state_file podman_ipv6_subnet)"
     set_ipv6_network_mode ""
-    rm -f "$(podman_state_file podman_ipv6_uplink)" "$(podman_state_file podman_ipv6_ndp_required)"
+    rm -f \
+        "$(podman_state_file podman_ipv6_uplink)" \
+        "$(podman_state_file podman_ipv6_ndp_required)" \
+        "$(podman_state_file podman_ipv6_ndp_ready)" \
+        "$(podman_state_file podman_ipv6_ndp_ready_required)"
     rm -f "$net_err" 2>/dev/null || true
     return 1
 }
@@ -2120,15 +2140,41 @@ ndpresponder_supports_target_file() {
     grep -Eq -- '(^|[[:space:],])--target-file([[:space:],=]|$)' <<<"$help_output"
 }
 
+ndpresponder_supports_ready_file() {
+    local image="$1" help_output
+    # Every NDP-backed mode now waits for an explicit marker. Check this
+    # separately because ordinary managed networks do not need target-file.
+    help_output=$(podman run --rm "$image" --help 2>&1 || true)
+    grep -Eq -- '(^|[[:space:],])--ready-file([[:space:],=]|$)' <<<"$help_output"
+}
+
+ndpresponder_supports_manual_routed_features() {
+    local image="$1" help_output
+    # A responder that only recognizes --target-file can still retain its
+    # startup snapshot forever. Manual routed IPv6 needs both reload and
+    # readiness contracts so the controller never creates a container before
+    # its public /128 is actually reachable.
+    help_output=$(podman run --rm "$image" --help 2>&1 || true)
+    grep -Eq -- '(^|[[:space:],])--target-file([[:space:],=]|$)' <<<"$help_output" && \
+        grep -Eq -- '(^|[[:space:],])--target-file-reload-interval([[:space:],=]|$)' <<<"$help_output" && \
+        grep -Eq -- '(^|[[:space:],])--ready-file([[:space:],=]|$)' <<<"$help_output"
+}
+
 ndpresponder_image_supports_required_features() {
-    if [[ "${NDPRESPONDER_TARGET_FILE_REQUIRED:-false}" != true ]]; then
+    if [[ "${NDPRESPONDER_TARGET_FILE_REQUIRED:-false}" == true ]] && \
+       ndpresponder_supports_manual_routed_features "$1"; then
         return 0
     fi
-    if ndpresponder_supports_target_file "$1"; then
+    if [[ "${NDPRESPONDER_TARGET_FILE_REQUIRED:-false}" == true ]]; then
+        _yellow "Responder image does not support target-file reload and readiness; a source build is required for manual routed IPv6"
+        _yellow "ndpresponder 镜像不支持目标文件热加载和就绪标记；手动路由 IPv6 需要从源码构建新版程序"
+        return 1
+    fi
+    if ndpresponder_supports_ready_file "$1"; then
         return 0
     fi
-    _yellow "Responder image does not support --target-file; a source build is required for manual routed IPv6"
-    _yellow "ndpresponder 镜像不支持 --target-file；手动路由 IPv6 需要从源码构建新版程序"
+    _yellow "Responder image does not support --ready-file; a source build is required before enabling NDP IPv6"
+    _yellow "ndpresponder 镜像不支持 --ready-file；启用 NDP IPv6 前需从源码构建新版程序"
     return 1
 }
 
@@ -2148,12 +2194,12 @@ quarantine_incompatible_manual_ndpresponder() {
     [[ "${NDPRESPONDER_TARGET_FILE_REQUIRED:-false}" == true ]] || return 0
     existing_image=$(ndpresponder_existing_container_image 2>/dev/null || true)
     [[ -n "$existing_image" ]] || return 0
-    if ndpresponder_supports_target_file "$existing_image"; then
+    if ndpresponder_supports_manual_routed_features "$existing_image"; then
         return 0
     fi
 
-    _yellow "Existing ndpresponder cannot read --target-file; removing it to stop an incompatible restart loop"
-    _yellow "现有 ndpresponder 不支持 --target-file，正在移除以停止不兼容的重启循环"
+    _yellow "Existing ndpresponder lacks routed IPv6 reload/readiness support; removing it to stop an incompatible restart loop"
+    _yellow "现有 ndpresponder 缺少路由 IPv6 热加载/就绪支持，正在移除以停止不兼容的重启循环"
     # Updating the policy before removal handles older containers that were
     # created with --restart always and may otherwise keep consuming CPU while
     # a source-build fallback is unavailable.
@@ -2218,8 +2264,8 @@ resolve_ndpresponder_image() {
         return 1
     fi
     if ! ndpresponder_image_supports_required_features "$source_image"; then
-        _yellow "The source-built responder is missing the required target-file capability; preserving any existing responder"
-        _yellow "源码构建的 ndpresponder 缺少所需的 target-file 能力，将保留现有 responder"
+        _yellow "The source-built responder is missing the required readiness capabilities; preserving any existing responder"
+        _yellow "源码构建的 ndpresponder 缺少所需的就绪能力，将保留现有 responder"
         return 1
     fi
     NDPRESPONDER_IMAGE="$source_image"
@@ -2228,7 +2274,7 @@ resolve_ndpresponder_image() {
 
 start_ndpresponder() {
     _yellow "Starting NDP responder for IPv6..."
-    local podman_socket ndp_status ndp_logs ndp_image ndp_target_file network_mode ndp_required uplink
+    local podman_socket ndp_status ndp_logs ndp_image ndp_target_file ndp_ready_file network_mode ndp_required uplink
     local -a ndp_args podman_run_args
     if ! podman network exists podman-ipv6 2>/dev/null; then
         _yellow "podman-ipv6 network not found, skipping ndpresponder"
@@ -2275,6 +2321,11 @@ start_ndpresponder() {
     else
         NDPRESPONDER_TARGET_FILE_REQUIRED=false
     fi
+    ndp_ready_file=$(podman_state_file podman_ipv6_ndp_ready)
+    mkdir -p "$PODMAN_STATE_DIR"
+    : > "$ndp_ready_file"
+    chmod 600 "$ndp_ready_file"
+    rm -f "$(podman_state_file podman_ipv6_ndp_ready_required)"
     quarantine_incompatible_manual_ndpresponder
     if ! resolve_ndpresponder_image; then
         return 1
@@ -2291,14 +2342,16 @@ start_ndpresponder() {
         --cap-add=NET_ADMIN
         --network host
         --volume "${podman_socket}:/var/run/docker.sock:ro"
+        --volume "${ndp_ready_file}:/run/ndpresponder-ready"
     )
+    ndp_args=(--ready-file /run/ndpresponder-ready)
     if [[ "$network_mode" == "manual" ]]; then
         ndp_target_file=$(podman_state_file podman_ipv6_targets)
         [[ -f "$ndp_target_file" ]] || : > "$ndp_target_file"
-        ndp_args=(--target-file /etc/ndpresponder-targets)
+        ndp_args+=(--target-file /etc/ndpresponder-targets --target-file-reload-interval 2s)
         podman_run_args+=(--volume "${ndp_target_file}:/etc/ndpresponder-targets:ro")
     else
-        ndp_args=(-N podman-ipv6)
+        ndp_args+=(-N podman-ipv6)
     fi
     ndp_args=(-i "$uplink" "${ndp_args[@]}")
     if podman run -d "${podman_run_args[@]}" \
@@ -2306,25 +2359,27 @@ start_ndpresponder() {
         --name ndpresponder \
         "${ndp_image}" \
         "${ndp_args[@]}" 2>/dev/null; then
-        # ndpresponder verifies the API socket before serving. Keep observing
-        # past that bounded probe so a process that is about to exit is never
-        # recorded as a healthy IPv6 responder.
-        for _ndp_attempt in 1 2 3 4 5 6; do
+        # A running process may still be probing the uplink. Wait for its
+        # explicit readiness marker before recording IPv6 as available.
+        for ((_ndp_attempt = 1; _ndp_attempt <= 35; _ndp_attempt++)); do
             sleep 1
             ndp_status=$(podman inspect -f '{{.State.Status}}' ndpresponder 2>/dev/null || true)
-            if [[ "$ndp_status" == "running" ]]; then
-                _green "NDP responder started and connected to the Podman API socket"
+            if [[ "$ndp_status" == "running" && -s "$ndp_ready_file" ]]; then
+                printf '%s\n' true > "$(podman_state_file podman_ipv6_ndp_ready_required)"
+                _green "NDP responder started and is ready for IPv6 neighbor discovery"
                 return 0
             fi
         done
         ndp_logs=$(podman logs --tail 20 ndpresponder 2>&1 || true)
-        _yellow "ndpresponder exited immediately: ${ndp_logs}"
+        _yellow "ndpresponder did not become ready: ${ndp_logs}"
     else
         _yellow "ndpresponder start failed; IPv6 may require manual NDP configuration"
     fi
     # Do not leave a failed responder with an unconditional restart policy.
     # The old container would otherwise spin forever on an unsupported flag.
     podman rm -f ndpresponder 2>/dev/null || true
+    : > "$ndp_ready_file" 2>/dev/null || true
+    rm -f "$(podman_state_file podman_ipv6_ndp_ready_required)"
     return 1
 }
 # ======== 配置 podman.socket 服务（可选，供 API 使用） ========

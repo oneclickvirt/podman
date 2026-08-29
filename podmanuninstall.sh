@@ -1,7 +1,7 @@
 #!/bin/bash
 # from
 # https://github.com/oneclickvirt/podman
-# 2026.08.26
+# 2026.08.30
 # 完整卸载 Podman 环境及所有容器
 
 _red()    { echo -e "\033[31m\033[01m$*\033[0m"; }
@@ -325,7 +325,7 @@ fi
 # 删除所有 podman 状态文件
 for f in "${PODMAN_STATE_DIR%/}"/podman_*; do
     if [[ "$PODMAN_IPV6_BRIDGE_RETAINED" == "true" && "$f" == "$(podman_state_file podman_ipv6_bridge_owned)" ]]; then
-        _yellow "  保留 $f，避免重装时接管仍在使用的 podman-br1"
+        _yellow "  保留 ${f}，避免重装时接管仍在使用的 podman-br1"
         continue
     fi
     [[ -f "$f" ]] && rm -f "$f" && _yellow "  删除 $f"

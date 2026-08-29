@@ -1,7 +1,7 @@
 #!/bin/bash
 # from
 # https://github.com/oneclickvirt/podman
-# 2026.08.27
+# 2026.08.30
 
 # Usage:
 # ./onepodman.sh <name> <cpu> <memory_mb> <password> <sshport> <startport> <endport> [independent_ipv6:y/n] [system] [disk_gb]
@@ -387,10 +387,20 @@ elif [[ -f "$(podman_state_file podman_ipv6_enabled)" ]] && \
                     fi
                 else
                     ndp_status=$(podman inspect -f '{{.State.Status}}' ndpresponder 2>/dev/null || true)
-                    if [[ "$ndp_status" == "running" ]]; then
-                        IPV6_ENABLED=true
-                    else
+                    ndp_ready_required=false
+                    if [[ -s "$(podman_state_file podman_ipv6_ndp_ready_required)" ]]; then
+                        ndp_ready_required=$(tr -d '[:space:]' <"$(podman_state_file podman_ipv6_ndp_ready_required)" 2>/dev/null || true)
+                    fi
+                    if [[ "$ndp_status" != "running" ]]; then
                         _yellow "Podman IPv6 requires a healthy NDP responder on its Ethernet uplink; falling back to IPv4"
+                    elif [[ "$ndp_ready_required" == true && ! -s "$(podman_state_file podman_ipv6_ndp_ready)" ]]; then
+                        if [[ "$IPV6_NETWORK_MODE" == "manual" ]]; then
+                            _yellow "Podman routed IPv6 responder is not ready for public address attachment; falling back to IPv4"
+                        else
+                            _yellow "Podman IPv6 responder is restarting and has not reported readiness; falling back to IPv4"
+                        fi
+                    else
+                        IPV6_ENABLED=true
                     fi
                 fi
             fi
