@@ -12,7 +12,11 @@ is_truthy() {
         *) return 1 ;;
     esac
 }
-is_noninteractive() { is_truthy "${noninteractive:-${NONINTERACTIVE:-}}"; }
+is_noninteractive() {
+    noninteractive="${noninteractive:-${NONINTERACTIVE:-}}"
+    export noninteractive
+    is_truthy "$noninteractive"
+}
 python_cmd() { command -v python3 2>/dev/null || command -v python 2>/dev/null || true; }
 PODMAN_STATE_DIR="${PODMAN_STATE_DIR:-/usr/local/bin}"
 podman_state_file() {
@@ -43,7 +47,7 @@ if [ ! -d /usr/local/bin ]; then
     mkdir -p /usr/local/bin
 fi
 # ======== 系统检测 ========
-REGEX=("debian" "ubuntu" "centos|red hat|kernel|oracle linux|alma|rocky" "'amazon linux'" "fedora" "arch" "alpine")
+REGEX=("debian" "ubuntu" "centos|red hat|kernel|oracle linux|alma|rocky" "amazon[[:space:]]+linux" "fedora" "arch" "alpine")
 RELEASE=("Debian" "Ubuntu" "CentOS" "CentOS" "Fedora" "Arch" "Alpine")
 PACKAGE_INSTALL=(
     "apt-get -y install"
@@ -125,12 +129,16 @@ check_cdn_file
 run_package_update() {
     case $SYSTEM in
         Debian)
-            if ! apt-get update 2>/dev/null; then apt-get --fix-broken install -y 2>/dev/null || true; apt-get update 2>/dev/null || true; fi
+            if ! apt-get update 2>/dev/null; then
+                apt-get --fix-broken install -y 2>/dev/null || return 1
+                apt-get update 2>/dev/null || return 1
+            fi
             ;;
-        Ubuntu) apt-get update 2>/dev/null || true ;;
-        CentOS|Fedora) yum -y update 2>/dev/null || true ;;
-        Alpine) apk update 2>/dev/null || true ;;
-        Arch) pacman -Sy --noconfirm 2>/dev/null || true ;;
+        Ubuntu) apt-get update 2>/dev/null || return 1 ;;
+        CentOS) yum -y update 2>/dev/null || return 1 ;;
+        Fedora) dnf -y update 2>/dev/null || return 1 ;;
+        Alpine) apk update 2>/dev/null || return 1 ;;
+        Arch) pacman -Sy --noconfirm 2>/dev/null || return 1 ;;
     esac
 }
 update_sysctl() {
@@ -142,7 +150,7 @@ update_sysctl() {
     else
         echo "${key}=${val}" >> /etc/sysctl.conf
     fi
-    sysctl -w "${key}=${val}" >/dev/null 2>&1 || true
+    sysctl -w "${key}=${val}" >/dev/null 2>&1 || return 1
 }
 is_private_ipv6() {
     ! is_public_ipv6 "${1:-}"
@@ -152,11 +160,12 @@ check_storage_driver_support() {
     local driver="$1"
     case "$driver" in
         "btrfs")
-            if command -v btrfs >/dev/null 2>&1; then
-                modprobe btrfs 2>/dev/null || true
+            command -v btrfs >/dev/null 2>&1 || return 1
+            if grep -qw btrfs /proc/filesystems 2>/dev/null || grep -qw btrfs /proc/modules 2>/dev/null; then
                 return 0
             fi
-            return 1
+            modprobe btrfs 2>/dev/null || true
+            grep -qw btrfs /proc/filesystems 2>/dev/null || grep -qw btrfs /proc/modules 2>/dev/null
             ;;
         *) return 1 ;;
     esac
@@ -168,7 +177,12 @@ setup_podman_btrfs_loop() {
     _yellow "Setting up Podman btrfs loop filesystem..."
     local loop_dir
     loop_dir=$(dirname "$loop_file")
-    [[ ! -d "$loop_dir" ]] && mkdir -p "$loop_dir"
+    if [[ ! -d "$loop_dir" ]]; then
+        mkdir -p "$loop_dir" || {
+            _red "Failed to create Podman loop directory: $loop_dir"
+            return 1
+        }
+    fi
     # 若 loop 文件已存在，优先尝试复用，避免重跑安装时覆盖已有容器数据。
     if [[ -f "$loop_file" ]]; then
         local loop_device
@@ -180,20 +194,23 @@ setup_podman_btrfs_loop() {
         fi
         if [[ -n "$loop_device" ]]; then
             _green "Loop file $loop_file already exists, trying to reuse $loop_device."
-            mkdir -p "$mount_point"
+            mkdir -p "$mount_point" || return 1
             if mountpoint -q "$mount_point" 2>/dev/null || mount "$loop_device" "$mount_point" 2>/dev/null; then
                 if ! grep -Fq "$loop_file" /etc/fstab 2>/dev/null; then
-                    echo "$loop_file $mount_point btrfs loop,defaults 0 0" >> /etc/fstab
+                    printf '%s\n' "$loop_file $mount_point btrfs loop,defaults 0 0" >> /etc/fstab || return 1
                 fi
-                chmod 755 "$mount_point"
-                echo "$loop_device" > /usr/local/bin/podman_loop_device
-                echo "$loop_file"   > /usr/local/bin/podman_loop_file
-                echo "$mount_point" > /usr/local/bin/podman_mount_point
+                chmod 755 "$mount_point" || return 1
+                printf '%s\n' "$loop_device" > /usr/local/bin/podman_loop_device || return 1
+                printf '%s\n' "$loop_file" > /usr/local/bin/podman_loop_file || return 1
+                printf '%s\n' "$mount_point" > /usr/local/bin/podman_mount_point || return 1
                 _green "Existing btrfs loop filesystem reused: $mount_point"
                 return 0
             fi
-            if [[ "$attached_now" == "true" ]] || ! findmnt -S "$loop_device" >/dev/null 2>&1; then
+            if [[ "$attached_now" == "true" ]]; then
                 losetup -d "$loop_device" 2>/dev/null || true
+            else
+                _red "Existing Podman loop device is attached but its filesystem is not mounted; refusing to detach or replace it."
+                return 1
             fi
             _yellow "Existing loop file could not be mounted as btrfs; backing it up before recreation."
         else
@@ -209,31 +226,62 @@ setup_podman_btrfs_loop() {
     fi
     if mountpoint -q "$mount_point" 2>/dev/null; then
         _green "Mount point $mount_point is already mounted, skipping creation."
-        mkdir -p "$mount_point"
-        echo "$mount_point" > /usr/local/bin/podman_mount_point
+        mkdir -p "$mount_point" || return 1
+        printf '%s\n' "$mount_point" > /usr/local/bin/podman_mount_point || return 1
         return 0
     fi
     if [[ -d "$mount_point" ]] && [[ "$(ls -A "$mount_point" 2>/dev/null)" ]]; then
         _yellow "Backing up existing Podman data..."
-        mv "$mount_point" "${mount_point}.backup.$(date +%Y%m%d-%H%M%S)"
+        mv "$mount_point" "${mount_point}.backup.$(date +%Y%m%d-%H%M%S)" || {
+            _red "Failed to back up existing Podman data: $mount_point"
+            return 1
+        }
     fi
     _yellow "Creating ${pool_size_gb}GB loop file at $loop_file..."
-    fallocate -l "${pool_size_gb}G" "$loop_file"
+    if ! fallocate -l "${pool_size_gb}G" "$loop_file"; then
+        _red "Failed to allocate Podman btrfs loop file: $loop_file"
+        return 1
+    fi
     local loop_device
-    loop_device=$(losetup --find --show "$loop_file")
+    if ! loop_device=$(losetup --find --show "$loop_file") || [[ -z "$loop_device" ]]; then
+        _red "Failed to attach Podman btrfs loop file: $loop_file"
+        rm -f -- "$loop_file"
+        return 1
+    fi
     _green "Loop device created: $loop_device"
     _yellow "Formatting $loop_device as btrfs..."
-    mkfs.btrfs -f "$loop_device"
-    mkdir -p "$mount_point"
-    mount "$loop_device" "$mount_point"
-    if ! grep -Fq "$loop_file" /etc/fstab 2>/dev/null; then
-        echo "$loop_file $mount_point btrfs loop,defaults 0 0" >> /etc/fstab
+    if ! mkfs.btrfs -f "$loop_device"; then
+        _red "Failed to format Podman btrfs loop device: $loop_device"
+        losetup -d "$loop_device" 2>/dev/null || true
+        rm -f -- "$loop_file"
+        return 1
     fi
-    chmod 755 "$mount_point"
+    if ! mkdir -p "$mount_point"; then
+        _red "Failed to create Podman mount point: $mount_point"
+        losetup -d "$loop_device" 2>/dev/null || true
+        rm -f -- "$loop_file"
+        return 1
+    fi
+    if ! mount "$loop_device" "$mount_point"; then
+        _red "Failed to mount Podman btrfs loop filesystem: $mount_point"
+        losetup -d "$loop_device" 2>/dev/null || true
+        rm -f -- "$loop_file"
+        return 1
+    fi
+    if ! grep -Fq "$loop_file" /etc/fstab 2>/dev/null; then
+        if ! printf '%s\n' "$loop_file $mount_point btrfs loop,defaults 0 0" >> /etc/fstab; then
+            _red "Failed to persist Podman btrfs mount in /etc/fstab"
+            umount "$mount_point" 2>/dev/null || true
+            losetup -d "$loop_device" 2>/dev/null || true
+            rm -f -- "$loop_file"
+            return 1
+        fi
+    fi
+    chmod 755 "$mount_point" || return 1
     _green "Podman btrfs loop filesystem setup completed"
-    echo "$loop_device" > /usr/local/bin/podman_loop_device
-    echo "$loop_file"   > /usr/local/bin/podman_loop_file
-    echo "$mount_point" > /usr/local/bin/podman_mount_point
+    printf '%s\n' "$loop_device" > /usr/local/bin/podman_loop_device || return 1
+    printf '%s\n' "$loop_file" > /usr/local/bin/podman_loop_file || return 1
+    printf '%s\n' "$mount_point" > /usr/local/bin/podman_mount_point || return 1
 }
 try_podman_storage_drivers() {
     podman_need_disk_limit="false"
@@ -248,10 +296,11 @@ try_podman_storage_drivers() {
     # 安装 btrfs 工具
     _yellow "Installing btrfs-progs for disk size limitation support..."
     case $SYSTEM in
-        Debian|Ubuntu) ${PACKAGE_INSTALL[int]} btrfs-progs 2>/dev/null || true ;;
-        CentOS|Fedora) ${PACKAGE_INSTALL[int]} btrfs-progs 2>/dev/null || true ;;
-        Alpine)        apk add --no-cache btrfs-progs 2>/dev/null || true ;;
-        Arch)          pacman -Sy --noconfirm btrfs-progs 2>/dev/null || true ;;
+        Debian|Ubuntu) ${PACKAGE_INSTALL[int]} btrfs-progs 2>/dev/null || return 1 ;;
+        CentOS|Fedora) ${PACKAGE_INSTALL[int]} btrfs-progs 2>/dev/null || return 1 ;;
+        Alpine)        apk add --no-cache btrfs-progs 2>/dev/null || return 1 ;;
+        Arch)          pacman -Sy --noconfirm btrfs-progs 2>/dev/null || return 1 ;;
+        *) _red "No supported package manager for btrfs-progs"; return 1 ;;
     esac
     modprobe btrfs 2>/dev/null || true
     if check_storage_driver_support "btrfs"; then
@@ -276,8 +325,12 @@ detect_interface() {
     if [[ -z "$interface" ]]; then
         interface=$(ip link show | awk '/^[0-9]+: /{gsub(":","",$2); if($2!="lo") {print $2; exit}}')
     fi
+    if [[ -z "$interface" ]]; then
+        _red "Could not determine a host network interface for Podman"
+        return 1
+    fi
     _blue "Detected interface: ${interface:-unknown}"
-    echo "${interface:-}" > /usr/local/bin/podman_main_interface
+    echo "$interface" > /usr/local/bin/podman_main_interface || return 1
     # 保存宿主机公网 IPv4（供容器创建脚本展示 SSH 连接信息用）
     if [[ ! -f /usr/local/bin/podman_main_ipv4 ]]; then
         local main_ipv4
@@ -605,24 +658,31 @@ install_base_deps() {
     _yellow "Installing base dependencies..."
     case $SYSTEM in
         Debian|Ubuntu)
-            run_package_update
+            run_package_update || return 1
             ${PACKAGE_INSTALL[int]} curl wget ca-certificates nftables iproute2 \
-                socat unzip tar jq python3 2>/dev/null || true
+                socat unzip tar jq python3 2>/dev/null || return 1
             ;;
         CentOS|Fedora)
-            ${PACKAGE_INSTALL[int]} curl wget ca-certificates nftables iproute \
-                socat unzip tar jq python3 2>/dev/null || true
+            run_package_update || return 1
+            if [[ "$SYSTEM" == "Fedora" ]]; then
+                dnf install -y curl wget ca-certificates nftables iproute socat unzip tar jq python3 2>/dev/null || return 1
+            else
+                yum install -y curl wget ca-certificates nftables iproute socat unzip tar jq python3 2>/dev/null || return 1
+            fi
             ;;
         Alpine)
-            run_package_update
+            run_package_update || return 1
             ${PACKAGE_INSTALL[int]} curl wget ca-certificates nftables iproute2 \
-                socat unzip tar jq python3 2>/dev/null || true
+                socat unzip tar jq python3 2>/dev/null || return 1
             ;;
         Arch)
-            run_package_update
+            run_package_update || return 1
             ${PACKAGE_INSTALL[int]} curl wget ca-certificates nftables iproute2 \
-                socat unzip tar jq python 2>/dev/null || true
+                socat unzip tar jq python 2>/dev/null || return 1
             ;;
+        *)
+            _red "Unsupported package manager for Podman prerequisites"
+            return 1
     esac
     _green "Base dependencies installed"
 }
@@ -635,9 +695,19 @@ detect_firewall_backend() {
     else
         _yellow "nftables not functional, falling back to iptables"
         FIREWALL_BACKEND="iptables"
+        if ! command -v iptables >/dev/null 2>&1; then
+            case $SYSTEM in
+                Debian|Ubuntu|CentOS|Fedora|Alpine|Arch)
+                    ${PACKAGE_INSTALL[int]} iptables 2>/dev/null || true
+                    ;;
+            esac
+        fi
+        if ! command -v iptables >/dev/null 2>&1; then
+            _red "No working nftables or iptables backend is available"
+            return 1
+        fi
         case $SYSTEM in
             Debian|Ubuntu)
-                ${PACKAGE_INSTALL[int]} iptables 2>/dev/null || true
                 # iptables-persistent 同时处理 IPv4 和 IPv6 规则持久化
                 _yellow "Installing iptables-persistent for rule persistence..."
                 echo iptables-persistent iptables-persistent/autosave_v4 boolean true | debconf-set-selections
@@ -680,7 +750,7 @@ install_podman() {
     fi
     case $SYSTEM in
         Ubuntu)
-            run_package_update
+            run_package_update || return 1
             # Ubuntu 22.04+ 直接有 podman
             ${PACKAGE_INSTALL[int]} podman 2>/dev/null || true
             # 若版本过旧则添加 kubic 源
@@ -690,12 +760,12 @@ install_podman() {
                 echo "deb https://download.opensuse.org/repositories/devel:/kubic:/libcontainers:/stable/xUbuntu_${VERSION_ID}/ /" \
                     > /etc/apt/sources.list.d/devel:kubic:libcontainers:stable.list
                 curl -L "https://download.opensuse.org/repositories/devel:/kubic:/libcontainers:/stable/xUbuntu_${VERSION_ID}/Release.key" | apt-key add - 2>/dev/null || true
-                apt-get update 2>/dev/null || true
-                ${PACKAGE_INSTALL[int]} podman 2>/dev/null || true
+                apt-get update 2>/dev/null || return 1
+                ${PACKAGE_INSTALL[int]} podman 2>/dev/null || return 1
             fi
             ;;
         Debian)
-            run_package_update
+            run_package_update || return 1
             ${PACKAGE_INSTALL[int]} podman 2>/dev/null || true
             if ! command -v podman >/dev/null 2>&1; then
                 # shellcheck disable=SC1091
@@ -703,30 +773,33 @@ install_podman() {
                 echo "deb https://download.opensuse.org/repositories/devel:/kubic:/libcontainers:/stable/Debian_${VERSION_ID}/ /" \
                     > /etc/apt/sources.list.d/devel:kubic:libcontainers:stable.list
                 curl -L "https://download.opensuse.org/repositories/devel:/kubic:/libcontainers:/stable/Debian_${VERSION_ID}/Release.key" | apt-key add - 2>/dev/null || true
-                apt-get update 2>/dev/null || true
-                ${PACKAGE_INSTALL[int]} podman 2>/dev/null || true
+                apt-get update 2>/dev/null || return 1
+                ${PACKAGE_INSTALL[int]} podman 2>/dev/null || return 1
             fi
             ;;
         CentOS)
             # RHEL/AlmaLinux/Rocky/CentOS 8+
-            dnf install -y podman 2>/dev/null || yum install -y podman 2>/dev/null || true
+            dnf install -y podman 2>/dev/null || yum install -y podman 2>/dev/null || return 1
             ;;
         Fedora)
-            dnf install -y podman 2>/dev/null || true
+            dnf install -y podman 2>/dev/null || return 1
             ;;
         Alpine)
-            apk update 2>/dev/null || true
-            apk add --no-cache podman fuse-overlayfs 2>/dev/null || true
+            apk update 2>/dev/null || return 1
+            apk add --no-cache podman fuse-overlayfs 2>/dev/null || return 1
             ;;
         Arch)
-            pacman -Sy --noconfirm podman 2>/dev/null || true
+            pacman -Sy --noconfirm podman 2>/dev/null || return 1
             ;;
+        *)
+            _red "Unsupported package manager for Podman"
+            return 1
     esac
     if command -v podman >/dev/null 2>&1; then
         _green "Podman installed: $(podman --version)"
     else
         _red "Podman installation failed, please install manually"
-        exit 1
+        return 1
     fi
 }
 
@@ -779,19 +852,21 @@ install_podman_network_dependencies() {
     if podman_network_binary_available netavark; then
         _green "Netavark network backend is available"
     else
-        _yellow "Warning: netavark binary not found; Podman network creation may fail"
+        _red "netavark binary is required for the configured Podman network backend"
+        return 1
     fi
     if podman_network_binary_available aardvark; then
         _green "aardvark-dns is available"
     else
         _yellow "Warning: aardvark-dns binary not found; DNS will be disabled for networks without an explicit DNS backend"
     fi
+    return 0
 }
 
 # ======== 配置 Podman 存储 ========
 configure_podman_storage() {
     _yellow "Configuring Podman storage..."
-    mkdir -p /etc/containers
+    mkdir -p /etc/containers || return 1
     # 读取存储驱动配置（由 try_podman_storage_drivers 写入）
     local storage_driver="overlay"
     if [[ -f /usr/local/bin/podman_storage_driver ]]; then
@@ -809,7 +884,7 @@ configure_podman_storage() {
         _mp=$(cat /usr/local/bin/podman_mount_point)
         [[ -n "$_mp" ]] && graph_root="$_mp"
     fi
-    mkdir -p "$graph_root" 2>/dev/null || true
+    mkdir -p "$graph_root" 2>/dev/null || return 1
     if [[ "$graph_root" != "/var/lib/containers/storage" ]] && command -v semanage >/dev/null 2>&1 && command -v restorecon >/dev/null 2>&1; then
         semanage fcontext -a -e /var/lib/containers "$graph_root" 2>/dev/null || true
         restorecon -R "$graph_root" 2>/dev/null || true
@@ -886,6 +961,7 @@ EOF
     # 确保 overlay 内核模块加载
     modprobe overlay 2>/dev/null || true
     _green "Podman storage configured"
+    return 0
 }
 # ======== 配置内核参数 ========
 configure_kernel() {
@@ -895,12 +971,14 @@ configure_kernel() {
     if [[ "${FIREWALL_BACKEND:-nftables}" == "nftables" ]]; then
         modprobe nf_tables 2>/dev/null || true
     fi
-    update_sysctl "net.ipv4.ip_forward=1"
-    update_sysctl "net.bridge.bridge-nf-call-iptables=1"
-    update_sysctl "net.bridge.bridge-nf-call-ip6tables=1"
-    update_sysctl "kernel.unprivileged_userns_clone=1"
-    sysctl --system >/dev/null 2>&1 || true
+    update_sysctl "net.ipv4.ip_forward=1" || return 1
+    update_sysctl "net.bridge.bridge-nf-call-iptables=1" || _yellow "bridge-nf-call-iptables is unavailable; continuing with nftables"
+    update_sysctl "net.bridge.bridge-nf-call-ip6tables=1" || _yellow "bridge-nf-call-ip6tables is unavailable; continuing with nftables"
+    update_sysctl "kernel.unprivileged_userns_clone=1" || _yellow "unprivileged user namespaces are unavailable"
+    sysctl --system >/dev/null 2>&1 || return 1
+    [[ "$(sysctl -n net.ipv4.ip_forward 2>/dev/null)" == "1" ]] || return 1
     _green "Kernel parameters configured"
+    return 0
 }
 ensure_subid_range() {
     local file="$1"
@@ -942,25 +1020,42 @@ configure_rootless_user() {
 # ======== 创建 Podman IPv4 网络 ========
 create_podman_network() {
     _yellow "Creating Podman IPv4 network (podman-net)..."
+    local dns_options=()
+    if ! podman_network_binary_available aardvark; then
+        dns_options=(--disable-dns)
+    fi
     if podman network exists podman-net 2>/dev/null; then
-        _green "podman-net already exists"
-        return 0
+        local existing_network
+        existing_network=$(podman network inspect podman-net 2>/dev/null) || return 1
+        if jq -e '
+            .[0] as $network |
+            ($network.driver // $network.Driver) == "bridge" and
+            ((($network.subnets // $network.Subnets // []) | map(.subnet // .Subnet) | index("172.20.0.0/16")) != null)
+        ' <<<"$existing_network" >/dev/null 2>&1; then
+            _green "podman-net already exists with the expected IPv4 bridge"
+            return 0
+        fi
+        _red "Existing podman-net has an incompatible driver or subnet; preserving it"
+        return 1
     fi
     podman network create \
         --driver bridge \
+        "${dns_options[@]}" \
         --interface-name podman-br0 \
         --subnet 172.20.0.0/16 \
         --gateway 172.20.0.1 \
         podman-net 2>/dev/null || \
     podman network create \
         --driver bridge \
+        "${dns_options[@]}" \
         --subnet 172.20.0.0/16 \
         --gateway 172.20.0.1 \
-        podman-net 2>/dev/null || true
+        podman-net || return 1
     if podman network exists podman-net 2>/dev/null; then
         _green "podman-net created (172.20.0.0/16)"
     else
-        _yellow "Warning: podman-net creation may have failed, check manually"
+        _red "podman-net is unavailable after creation"
+        return 1
     fi
 }
 # ======== 配置 IPv6 内核参数 ========
@@ -972,12 +1067,12 @@ adapt_ipv6() {
         _yellow "Could not determine the IPv6 uplink; leaving host IPv6 settings unchanged"
         return 1
     fi
-    update_sysctl "net.ipv6.conf.all.forwarding=1"
+    update_sysctl "net.ipv6.conf.all.forwarding=1" || return 1
     # Enabling forwarding makes Linux ignore normal router advertisements
     # unless the actual IPv6 uplink opts in explicitly. ndpresponder answers
     # NDP itself, so do not change global proxy_ndp state owned by the host.
-    update_sysctl "net.ipv6.conf.${uplink}.accept_ra=2"
-    sysctl --system >/dev/null 2>&1 || true
+    update_sysctl "net.ipv6.conf.${uplink}.accept_ra=2" || return 1
+    sysctl --system >/dev/null 2>&1 || return 1
 }
 # ======== 创建 Podman IPv6 网络 ========
 set_ipv6_network_mode() {
@@ -1360,9 +1455,9 @@ ensure_unmanaged_ipv6_bridge() {
         _yellow "Failed to configure ${gateway}/${prefix_len} on podman-br1"
         return 1
     fi
-    update_sysctl "net.ipv6.conf.podman-br1.forwarding=1"
-    update_sysctl "net.ipv6.conf.podman-br1.accept_ra=0"
-    update_sysctl "net.ipv6.conf.podman-br1.accept_dad=0"
+    update_sysctl "net.ipv6.conf.podman-br1.forwarding=1" || return 1
+    update_sysctl "net.ipv6.conf.podman-br1.accept_ra=0" || return 1
+    update_sysctl "net.ipv6.conf.podman-br1.accept_dad=0" || return 1
     printf '%s\n' "$gateway" > "$(podman_state_file podman_ipv6_gateway)"
     return 0
 }
@@ -2454,13 +2549,19 @@ verify_install() {
         fi
         # 尝试读取 OCI 运行时（不影响主流程）
         local _oci
-        _oci=$(podman info --format '{{.Host.OCIRuntime.Name}}' 2>/dev/null || true)
+        _oci=$(podman info --format '{{.Host.OCIRuntime.Name}}') || return 1
+        [[ -n "$_oci" ]] || { _red "OCI runtime is unavailable"; return 1; }
         [[ -n "$_oci" ]] && _green "  ✓ OCI runtime: ${_oci}"
     else
         _red "  ✗ podman not found"
+        return 1
     fi
     if podman network exists podman-net 2>/dev/null; then
         _green "  ✓ podman-net network exists"
+        podman network inspect podman-net >/dev/null || return 1
+    else
+        _red "podman-net is unavailable"
+        return 1
     fi
     if [[ "$(cat "$(podman_state_file podman_ipv6_enabled)" 2>/dev/null)" == "true" ]]; then
         if podman network exists podman-ipv6 2>/dev/null; then
@@ -2482,10 +2583,10 @@ main() {
             break
         fi
     done
-    install_base_deps
-    detect_interface
+    install_base_deps || return 1
+    detect_interface || return 1
     check_ipv6
-    detect_firewall_backend
+    detect_firewall_backend || return 1
     # ======== 硬盘限制支持询问 ========
     # 支持以下环境变量实现一键安装（跳过所有交互提示）：
     #   noninteractive=true            使用默认值跳过所有交互提示
@@ -2526,6 +2627,14 @@ main() {
     if [[ -z "$_podman_install_path" ]]; then
         _podman_install_path="/var/lib/containers/storage"
     fi
+    if [[ "$_podman_install_path" != /* ]]; then
+        _red "PODMAN_INSTALL_PATH must be an absolute path"
+        return 1
+    fi
+    mkdir -p "$_podman_install_path" || {
+        _red "Unable to create Podman storage path: $_podman_install_path"
+        return 1
+    }
     echo "$_podman_install_path" > /usr/local/bin/podman_install_path
     if is_truthy "${_need_disk_limit_input:-}"; then
         echo "true" > /usr/local/bin/podman_need_disk_limit
@@ -2561,6 +2670,10 @@ main() {
         if [[ -z "$_podman_loop_file" ]]; then
             _podman_loop_file="/opt/podman-pool.img"
         fi
+        if [[ "$_podman_loop_file" != /* ]]; then
+            _red "PODMAN_LOOP_FILE must be an absolute path"
+            return 1
+        fi
         _green "将安装支持容器磁盘大小限制的Podman环境（btrfs存储驱动）"
         _green "Will install Podman with container disk size limitation support (btrfs storage driver)"
     else
@@ -2581,12 +2694,12 @@ main() {
             exit 1
         fi
     fi
-    install_podman
-    install_podman_network_dependencies
-    configure_podman_storage
-    configure_kernel
+    install_podman || return 1
+    install_podman_network_dependencies || return 1
+    configure_podman_storage || return 1
+    configure_kernel || return 1
     configure_rootless_user
-    create_podman_network
+    create_podman_network || return 1
     setup_podman_socket
     setup_dns_check
     if [[ "$IPV6_ENABLED" == true ]]; then
@@ -2603,7 +2716,7 @@ main() {
     fi
     # 保存架构信息
     echo "$ARCH_TYPE" > /usr/local/bin/podman_arch
-    verify_install
+    verify_install || return 1
     echo
     _green "======================================================"
     _green "  ✓ Podman 安装完成！"

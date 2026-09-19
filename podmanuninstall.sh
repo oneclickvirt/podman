@@ -19,7 +19,9 @@ is_truthy() {
     esac
 }
 is_noninteractive() {
-    is_truthy "${noninteractive:-${NONINTERACTIVE:-}}"
+    noninteractive="${noninteractive:-${NONINTERACTIVE:-}}"
+    export noninteractive
+    is_truthy "$noninteractive"
 }
 remove_fstab_entry() {
     local needle="$1"
