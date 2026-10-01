@@ -43,7 +43,7 @@ done
 
 # ======== 安装必要组件 ========
 install_required_modules() {
-    local modules=("wget" "curl" "sudo" "openssh-server")
+    local modules=("wget" "curl" "sudo" "openssh-server" "ca-certificates")
     case $SYSTEM in
         Debian|Ubuntu)
             apt-get update -y 2>/dev/null || true

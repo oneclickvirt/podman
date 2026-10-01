@@ -6,12 +6,12 @@ on:
   workflow_dispatch:
     inputs:
       os:
-        description: 'OS to build (leave empty to build all)'
-        required: false
-        default: ''
+        description: 'OS to build (all builds every OS)'
+        required: true
+        default: all
         type: choice
         options:
-          - ''
+          - all
           - ubuntu
           - debian
           - alpine
@@ -32,7 +32,7 @@ concurrency:
 
 jobs:
   script-regression:
-    name: IPv6 network script regression
+    name: Shell script regression
     runs-on: ubuntu-latest
     timeout-minutes: 10
     permissions:
@@ -41,19 +41,21 @@ jobs:
       - name: Checkout repository
         uses: actions/checkout@v7
 
-      - name: Verify IPv6 subnet allocation safeguards
+      - name: Verify shell script contracts
         shell: bash
         run: |
           set -euo pipefail
           sudo apt-get update -y
           sudo apt-get install -y --no-install-recommends shellcheck
-          bash -n podmaninstall.sh scripts/onepodman.sh
+          bash -n podmaninstall.sh podmanuninstall.sh scripts/onepodman.sh
           # This test dynamically sources installer helpers and replaces
           # external commands with function mocks, which ShellCheck cannot
           # statically trace on the Ubuntu runner.
           shellcheck -e SC2317 tests/test_ipv6_network.sh
           bash tests/test_ipv6_network.sh
           bash tests/test_ssh_ipv6_listener.sh
+          bash tests/host_ipv6_preservation_test.sh
+          bash tests/uninstall_package_test.sh
 
   build:
     name: Build ${{ matrix.os }} (${{ matrix.arch }})
@@ -123,7 +125,7 @@ jobs:
         id: check
         run: |
           INPUT_OS="${{ github.event.inputs.os || '' }}"
-          if [[ -z "$INPUT_OS" || "$INPUT_OS" == "${{ matrix.os }}" ]]; then
+          if [[ -z "$INPUT_OS" || "$INPUT_OS" == "all" || "$INPUT_OS" == "${{ matrix.os }}" ]]; then
             echo "should_build=true" >> "$GITHUB_OUTPUT"
           else
             echo "should_build=false" >> "$GITHUB_OUTPUT"
@@ -241,7 +243,7 @@ jobs:
         id: check
         run: |
           INPUT_OS="${{ github.event.inputs.os || '' }}"
-          if [[ -z "$INPUT_OS" || "$INPUT_OS" == "${{ matrix.os }}" ]]; then
+          if [[ -z "$INPUT_OS" || "$INPUT_OS" == "all" || "$INPUT_OS" == "${{ matrix.os }}" ]]; then
             echo "should_build=true" >> "$GITHUB_OUTPUT"
           else
             echo "should_build=false" >> "$GITHUB_OUTPUT"

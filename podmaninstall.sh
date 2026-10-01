@@ -459,11 +459,12 @@ PY
 }
 
 ipv6_subnet_has_live_address() {
-    local subnet="$1"
+    local subnet="$1" addresses
     local py_bin
     py_bin=$(python_cmd)
     [[ -n "$py_bin" ]] || return 1
-    ip -6 -o addr show 2>/dev/null | awk '$0 !~ / tentative/ {print $4}' | \
+    addresses=$(podman_ipv6_ip_json_rows addresses) || return 0
+    printf '%s\n' "$addresses" | awk -F '\t' 'NF >= 2 {print $2}' | \
         "$py_bin" -c '
 import ipaddress
 import sys
@@ -481,11 +482,12 @@ raise SystemExit(1)
 }
 
 ipv6_subnet_overlaps_live_network() {
-    local subnet="$1"
+    local subnet="$1" addresses
     local py_bin
     py_bin=$(python_cmd)
     [[ -n "$py_bin" ]] || return 1
-    ip -6 -o addr show 2>/dev/null | awk '$0 !~ / tentative/ {print $4}' | \
+    addresses=$(podman_ipv6_ip_json_rows addresses) || return 0
+    printf '%s\n' "$addresses" | awk -F '\t' 'NF >= 2 {print $2}' | \
         "$py_bin" -c '
 import ipaddress
 import sys
@@ -507,13 +509,15 @@ raise SystemExit(1)
 # the kernel reject that topology, so inspect both addresses and connected
 # IPv6 routes before handing a subnet to a managed bridge.
 ipv6_subnet_overlaps_host() {
-    local subnet="$1"
+    local subnet="$1" addresses routes
     local py_bin
     py_bin=$(python_cmd)
     [[ -n "$py_bin" ]] || return 2
+    addresses=$(podman_ipv6_ip_json_rows addresses) || return 0
+    routes=$(podman_ipv6_ip_json_rows routes) || return 0
     {
-        ip -6 -o addr show 2>/dev/null | awk '$0 !~ / tentative/ {print $4}'
-        ip -6 route show table all 2>/dev/null | awk '$1 ~ /^[0-9A-Fa-f:]+\/[0-9]+$/ {print $1}'
+        printf '%s\n' "$addresses" | awk -F '\t' 'NF >= 2 {print $2}'
+        printf '%s\n' "$routes"
     } | "$py_bin" -c '
 import ipaddress
 import sys
@@ -541,6 +545,62 @@ raise SystemExit(1)
 # hosts commonly expose the /128 first and their usable /38 on vmbr2 later.
 # A lone /128 remains a valid connectivity signal and is retained as a
 # fallback for IPv6 modes that do not allocate public child addresses.
+podman_ipv6_ip_json_rows() {
+    local mode="$1" target="${2:-}"
+    local py_bin
+    py_bin=$(python_cmd)
+    [[ -n "$py_bin" ]] || return 1
+    "$py_bin" - "$mode" "$target" <<'PY'
+import ipaddress
+import json
+import os
+import re
+import subprocess
+import sys
+
+mode, target = sys.argv[1:]
+args = {
+    "addresses": ["-6", "addr", "show"],
+    "routes": ["-6", "route", "show", "table", "all"],
+    "default": ["-6", "route", "show", "default"],
+    "link_type": ["-d", "link", "show", "dev", target],
+}.get(mode)
+if args is None:
+    raise SystemExit(1)
+try:
+    env = dict(os.environ, LC_ALL="C", NO_COLOR="1")
+    raw = subprocess.check_output(["ip", "-j", *args], env=env,
+                                  stderr=subprocess.DEVNULL)
+    raw = re.sub(rb"\x1b\[[0-?]*[ -/]*[@-~]", b"", raw)
+    data = json.loads(raw)
+    if not isinstance(data, list):
+        raise ValueError("invalid ip JSON")
+    if mode == "addresses":
+        for interface in data:
+            name = interface.get("ifname", "")
+            for item in interface.get("addr_info", []):
+                if item.get("family") != "inet6" or item.get("tentative") or "tentative" in item.get("flags", []):
+                    continue
+                cidr = f'{item["local"]}/{item["prefixlen"]}'
+                ipaddress.IPv6Interface(cidr)
+                print(name, cidr, item.get("scope", ""), sep="\t")
+    elif mode == "routes":
+        for route in data:
+            destination = route.get("dst", "default")
+            if destination != "default":
+                print(ipaddress.IPv6Network(destination, strict=False))
+    elif mode == "default":
+        for route in data:
+            if route.get("dst", "default") == "default" and route.get("dev"):
+                print(route["dev"])
+                break
+    elif data:
+        print(data[0].get("link_type", ""))
+except (OSError, subprocess.CalledProcessError, ValueError, KeyError, TypeError):
+    raise SystemExit(1)
+PY
+}
+
 select_public_ipv6_cidr() {
     local candidate address prefix prefix_number best_cidr="" best_prefix=129
     while IFS= read -r candidate; do
@@ -554,7 +614,7 @@ select_public_ipv6_cidr() {
             best_cidr="$candidate"
             best_prefix=$prefix_number
         fi
-    done < <(ip -6 -o addr show scope global 2>/dev/null | awk '$0 !~ / tentative/ {print $4}')
+    done < <(podman_ipv6_ip_json_rows addresses 2>/dev/null | awk -F '\t' '$3 == "global" {print $2}')
     [[ -n "$best_cidr" ]] || return 1
     printf '%s\n' "$best_cidr"
 }
@@ -570,23 +630,14 @@ podman_ipv6_uplink_interface() {
         selected=$(select_public_ipv6_cidr 2>/dev/null || true)
     fi
     if [[ "$selected" == */* ]]; then
-        selected_if=$(ip -6 -o addr show scope global 2>/dev/null | awk -v cidr="$selected" '$4 == cidr {print $2; exit}')
+        selected_if=$(podman_ipv6_ip_json_rows addresses 2>/dev/null | awk -F '\t' -v cidr="$selected" '$2 == cidr {print $1; exit}')
         if [[ -n "$selected_if" ]] && ip link show dev "$selected_if" >/dev/null 2>&1; then
             printf '%s\n' "$selected_if"
             return 0
         fi
     fi
 
-    uplink=$(ip -6 route show default 2>/dev/null | awk '
-        /^default / {
-            for (i = 1; i < NF; i++) {
-                if ($i == "dev") {
-                    print $(i + 1)
-                    exit
-                }
-            }
-        }
-    ')
+    uplink=$(podman_ipv6_ip_json_rows default 2>/dev/null | sed -n '1p')
     if [[ -n "$uplink" ]] && ip link show dev "$uplink" >/dev/null 2>&1; then
         printf '%s\n' "$uplink"
         return 0
@@ -596,10 +647,10 @@ podman_ipv6_uplink_interface() {
 }
 
 podman_ipv6_uplink_supports_ndp() {
-    local uplink="$1" link_info
+    local uplink="$1" link_type
     [[ -n "$uplink" ]] || return 1
-    link_info=$(ip -d link show dev "$uplink" 2>/dev/null || ip link show dev "$uplink" 2>/dev/null || true)
-    grep -q 'link/ether' <<<"$link_info"
+    link_type=$(podman_ipv6_ip_json_rows link_type "$uplink" 2>/dev/null) || return 1
+    [[ "$link_type" == ether ]]
 }
 
 # Record whether the current IPv6 topology really needs neighbor discovery.
@@ -1633,13 +1684,57 @@ try:
     parent = ipaddress.IPv6Network(sys.argv[2], strict=False)
 except ValueError:
     raise SystemExit(1)
-raise SystemExit(0 if address in parent and not address.is_unspecified and not address.is_multicast else 1)
+raise SystemExit(0 if address in parent and address != parent.network_address and not address.is_unspecified and not address.is_multicast else 1)
+PY
+}
+host_ipv6_address_available() {
+    python3 - "$1" "$2" "$3" <<'PY'
+import ipaddress
+import json
+import os
+import re
+import subprocess
+import sys
+
+target = ipaddress.IPv6Address(sys.argv[1])
+bridge, existing = sys.argv[2:]
+env = dict(os.environ, LC_ALL="C", NO_COLOR="1")
+
+def ip_json(*args):
+    output = subprocess.check_output(["ip", "-j", "-6", *args],
+                                     stderr=subprocess.DEVNULL, env=env)
+    output = re.sub(rb"\x1b\[[0-?]*[ -/]*[@-~]", b"", output)
+    value = json.loads(output)
+    if not isinstance(value, list):
+        raise ValueError("invalid ip JSON")
+    return value
+
+try:
+    for iface in ip_json("addr", "show"):
+        for item in iface.get("addr_info", []):
+            if item.get("family") == "inet6" and ipaddress.IPv6Address(item["local"]) == target:
+                raise SystemExit(1)
+    for route in ip_json("route", "show", "table", "all"):
+        destination = route.get("dst", "default")
+        if destination == "default":
+            gateway = route.get("gateway")
+            if gateway and ipaddress.IPv6Address(gateway) == target:
+                raise SystemExit(1)
+            continue
+        network = ipaddress.IPv6Network(destination, strict=False)
+        if network.prefixlen == 128 and target in network:
+            if route.get("dev") != bridge or existing != str(target):
+                raise SystemExit(1)
+except (OSError, subprocess.CalledProcessError, ValueError, KeyError, TypeError):
+    raise SystemExit(1)
 PY
 }
 allocate_address() {
     python3 - "$parent" "$map_file" "$gateway" <<'PY'
 import ipaddress
+import json
 import os
+import re
 import subprocess
 import sys
 
@@ -1658,38 +1753,30 @@ try:
     used.add(ipaddress.IPv6Address(sys.argv[3]))
 except ValueError:
     pass
+def ip_json(*args):
+    env = dict(os.environ, LC_ALL="C", NO_COLOR="1")
+    raw = subprocess.check_output(["ip", "-j", "-6", *args], env=env,
+                                  stderr=subprocess.DEVNULL)
+    raw = re.sub(rb"\x1b\[[0-?]*[ -/]*[@-~]", b"", raw)
+    value = json.loads(raw)
+    if not isinstance(value, list):
+        raise ValueError("invalid ip JSON")
+    return value
+
 try:
-    output = os.popen("ip -6 -o addr show 2>/dev/null").read()
-    for line in output.splitlines():
-        fields = line.split()
-        if len(fields) >= 4:
-            try:
-                address = ipaddress.IPv6Interface(fields[3]).ip
-            except ValueError:
-                continue
-            if address in parent:
-                used.add(address)
-except OSError:
-    pass
-try:
-    routes = subprocess.check_output(
-        ["ip", "-6", "route", "show", "default"],
-        text=True,
-        stderr=subprocess.DEVNULL,
-    )
-except (OSError, subprocess.CalledProcessError):
-    routes = ""
-for line in routes.splitlines():
-    fields = line.split()
-    for index, field in enumerate(fields[:-1]):
-        if field != "via":
-            continue
-        try:
-            upstream = ipaddress.IPv6Address(fields[index + 1])
-        except ValueError:
-            continue
-        if upstream in parent:
-            used.add(upstream)
+    for interface in ip_json("addr", "show"):
+        for item in interface.get("addr_info", []):
+            if item.get("family") == "inet6":
+                address = ipaddress.IPv6Address(item["local"])
+                if address in parent:
+                    used.add(address)
+    for route in ip_json("route", "show", "default"):
+        if route.get("gateway"):
+            upstream = ipaddress.IPv6Address(route["gateway"])
+            if upstream in parent:
+                used.add(upstream)
+except (OSError, subprocess.CalledProcessError, ValueError, KeyError, TypeError):
+    raise SystemExit(1)
 start = int(parent.network_address) + (0x1000 if parent.prefixlen <= 112 else 1)
 limit = min(int(parent.broadcast_address), start + 1_000_000)
 for value in range(start, limit + 1):
@@ -1749,25 +1836,112 @@ release_lock() {
     rmdir "$lock_dir" 2>/dev/null || true
 }
 find_container_iface() {
-    local name="$1" pid="$2" ula iface
+    local name="$1" pid="$2" ula
     ula=$($runtime inspect -f '{{range .NetworkSettings.Networks}}{{.GlobalIPv6Address}}{{"\n"}}{{end}}' "$name" 2>/dev/null | awk '/:/{print; exit}' || true)
-    if [[ -n "$ula" ]]; then
-        iface=$(nsenter -t "$pid" -n ip -o -6 addr show 2>/dev/null | awk -v target="$ula" '$4 ~ ("^" target "/") {print $2; exit}' || true)
-        [[ -n "$iface" ]] && { printf '%s\n' "$iface"; return 0; }
-    fi
-    nsenter -t "$pid" -n ip -o link show 2>/dev/null | awk -F': ' '$2 !~ /^lo(@|:|$)/ {gsub(/@.*/, "", $2); iface=$2} END {if (iface != "") print iface}'
+    python3 - "$pid" "$ula" <<'PY'
+import ipaddress
+import json
+import os
+import re
+import subprocess
+import sys
+
+pid, raw_ula = sys.argv[1:]
+env = dict(os.environ, LC_ALL="C", NO_COLOR="1")
+ansi = rb"\x1b\[[0-?]*[ -/]*[@-~]"
+try:
+    ula = ipaddress.IPv6Address(re.sub(ansi, b"", raw_ula.encode()).decode().strip()) if raw_ula else None
+    def ip_json(*args):
+        raw = subprocess.check_output(["nsenter", "-t", pid, "-n", "ip", "-j", *args],
+                                      stderr=subprocess.DEVNULL, env=env)
+        data = json.loads(re.sub(ansi, b"", raw))
+        if not isinstance(data, list):
+            raise ValueError("invalid namespace JSON")
+        return data
+    if ula:
+        for interface in ip_json("-6", "addr", "show"):
+            for address in interface.get("addr_info", []):
+                if address.get("family") == "inet6" and ipaddress.IPv6Address(address["local"]) == ula:
+                    print(interface["ifname"].split("@", 1)[0])
+                    raise SystemExit(0)
+    candidate = ""
+    for interface in ip_json("link", "show"):
+        name = interface.get("ifname", "").split("@", 1)[0]
+        if name != "lo" and re.fullmatch(r"[A-Za-z0-9_.:-]{1,15}", name):
+            candidate = name
+    if candidate:
+        print(candidate)
+        raise SystemExit(0)
+except (OSError, subprocess.CalledProcessError, ValueError, KeyError, TypeError):
+    pass
+raise SystemExit(1)
+PY
+}
+routed_state_matches() {
+    python3 - "$1" "$2" "$3" "$4" "$5" <<'PY'
+import ipaddress
+import json
+import os
+import re
+import subprocess
+import sys
+
+pid, iface, raw_address, raw_gateway, bridge = sys.argv[1:]
+env = dict(os.environ, LC_ALL="C", NO_COLOR="1")
+try:
+    address = ipaddress.IPv6Address(raw_address)
+    gateway = ipaddress.IPv6Address(raw_gateway)
+    def ip_json(namespace, *args):
+        prefix = ["nsenter", "-t", pid, "-n"] if namespace else []
+        raw = subprocess.check_output([*prefix, "ip", "-j", "-6", *args],
+                                      stderr=subprocess.DEVNULL, env=env)
+        rows = json.loads(re.sub(rb"\x1b\[[0-?]*[ -/]*[@-~]", b"", raw))
+        if not isinstance(rows, list):
+            raise ValueError("invalid route JSON")
+        return rows
+    addresses = ip_json(True, "addr", "show", "dev", iface)
+    guest_routes = ip_json(True, "route", "show", "default")
+    host_routes = ip_json(False, "route", "show", f"{address}/128", "dev", bridge)
+    has_address = any(
+        row.get("ifname", "").split("@", 1)[0] == iface and any(
+            item.get("family") == "inet6" and
+            ipaddress.IPv6Address(item["local"]) == address and
+            item.get("prefixlen") == 128 for item in row.get("addr_info", []))
+        for row in addresses)
+    has_guest_route = any(
+        route.get("dst", "default") == "default" and
+        route.get("dev") == iface and
+        ipaddress.IPv6Address(route.get("gateway", "::")) == gateway
+        for route in guest_routes)
+    has_host_route = any(
+        route.get("dev") == bridge and
+        ipaddress.IPv6Network(route.get("dst", "::/0"), strict=False) ==
+        ipaddress.IPv6Network(f"{address}/128") for route in host_routes)
+    raise SystemExit(0 if has_address and has_guest_route and has_host_route else 1)
+except (OSError, subprocess.CalledProcessError, ValueError, KeyError, TypeError):
+    raise SystemExit(1)
+PY
 }
 attach_one_locked() {
-    local name="$1" requested="${2:-}" pid address iface
+    local name="$1" requested="${2:-}" pid address iface existing_address
     pid=$($runtime inspect -f '{{.State.Pid}}' "$name" 2>/dev/null || true)
     [[ "$pid" =~ ^[1-9][0-9]*$ ]] || return 1
-    address=$(awk -v name="$name" '$1 == name {print $2; exit}' "$map_file" 2>/dev/null || true)
+    existing_address=$(awk -v name="$name" '$1 == name {print $2; exit}' "$map_file" 2>/dev/null || true)
+    address="$existing_address"
     if [[ -n "$requested" ]]; then
         valid_ipv6_in_parent "$requested" "$parent" || { printf 'Requested IPv6 is outside the routed parent: %s\n' "$requested" >&2; return 1; }
+        if awk -v name="$name" -v address="$requested" '$1 != name && $2 == address {found=1} END {exit found ? 0 : 1}' "$map_file" 2>/dev/null; then
+            printf 'Requested IPv6 is already allocated: %s\n' "$requested" >&2
+            return 1
+        fi
         address="$requested"
     fi
     [[ -n "$address" ]] || address=$(allocate_address) || return 1
     valid_ipv6_in_parent "$address" "$parent" || return 1
+    host_ipv6_address_available "$address" "$bridge" "$existing_address" || {
+        printf 'IPv6 address is already owned by the host or another exact route: %s\n' "$address" >&2
+        return 1
+    }
     iface=$(find_container_iface "$name" "$pid")
     [[ -n "$iface" ]] || { printf 'Unable to find the IPv6 network interface for %s\n' "$name" >&2; return 1; }
 
@@ -1775,10 +1949,7 @@ attach_one_locked() {
     # externally visible postconditions before issuing namespace and route
     # mutations; this keeps a stable container from consuming CPU and filling
     # the kernel route transaction log every few seconds.
-    if [[ -n "$address" ]] && \
-       nsenter -t "$pid" -n ip -o -6 addr show dev "$iface" 2>/dev/null | awk -v wanted="$address/128" '$4 == wanted {found=1} END {exit found ? 0 : 1}' && \
-       nsenter -t "$pid" -n ip -6 route show default 2>/dev/null | awk -v gateway="$gateway" -v device="$iface" '$0 ~ ("via " gateway " ") && $0 ~ ("dev " device "([[:space:]]|$)") {found=1} END {exit found ? 0 : 1}' && \
-       ip -6 route show "$address/128" dev "$bridge" 2>/dev/null | grep -Fq "$address/128"; then
+    if [[ -n "$address" ]] && routed_state_matches "$pid" "$iface" "$address" "$gateway" "$bridge"; then
         replace_mapping "$name" "$address" || return 1
         printf '%s\n' "$address"
         return 0

@@ -36,7 +36,7 @@ fi
 
 # 安装 SSH 及相关工具
 apk update 2>/dev/null || true
-apk add --no-cache openssh-server openssh openssh-keygen bash curl wget cronie 2>/dev/null || true
+apk add --no-cache openssh-server openssh openssh-keygen bash curl wget cronie ca-certificates 2>/dev/null || true
 
 # 生成主机密钥
 mkdir -p /etc/ssh

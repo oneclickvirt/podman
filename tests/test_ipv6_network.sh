@@ -31,6 +31,8 @@ eval "$(extract_function podman_state_file)"
 eval "$(extract_function generate_ipv6_subnet_candidates)"
 # shellcheck disable=SC1090 # The test intentionally loads one installer function.
 eval "$(extract_function is_public_ipv6)"
+# shellcheck disable=SC1090 # The test intentionally loads the JSON ip parser.
+eval "$(extract_function podman_ipv6_ip_json_rows)"
 # shellcheck disable=SC1090 # The test intentionally loads the CIDR selector.
 eval "$(extract_function select_public_ipv6_cidr)"
 # shellcheck disable=SC1090 # The test intentionally loads IPv6 uplink helpers.
@@ -108,6 +110,46 @@ ip() {
         printf '%s\n' '2605:52c0:2:14b::/64 dev eth0 proto kernel'
     fi
 }
+cat >"$PODMAN_STATE_DIR/ip" <<'STUB'
+#!/bin/sh
+if [ "${1:-}" != "-j" ]; then exit 2; fi
+if [ "${2:-}" = "-d" ]; then
+    case "${6:-}" in
+        he-ipv6) printf '%s\n' '[{"ifname":"he-ipv6","link_type":"sit"}]' ;;
+        *) printf '%s\n' '[{"ifname":"vmbr2","link_type":"ether"}]' ;;
+    esac
+elif [ "${3:-}" = "route" ]; then
+    case " $* " in
+        *" default "*) printf '%s\n' '[{"dst":"default","dev":"eth0"}]' ;;
+        *) printf '%s\n' '[{"dst":"2605:52c0:2:14b::/64","dev":"eth0"}]' ;;
+    esac
+else
+    case "${IPV6_TEST_SCENARIO:-default}" in
+        delegated)
+            printf '%s\n' '[{"ifname":"vmbr0","addr_info":[{"family":"inet6","local":"2a14:7c0:1002:10f8::1","prefixlen":128,"scope":"global"}]},{"ifname":"vmbr2","addr_info":[{"family":"inet6","local":"2a14:7c0:1002:10f8::1","prefixlen":38,"scope":"global"}]}]'
+            ;;
+        tunnel)
+            printf '%s\n' '[{"ifname":"he-ipv6","addr_info":[{"family":"inet6","local":"2001:470:1f14:9::2","prefixlen":64,"scope":"global"}]}]'
+            ;;
+        narrow120|narrow127|hostonly)
+            case "${IPV6_TEST_SCENARIO}" in
+                narrow120) cidr=2a14:6781:a::9; prefix=120 ;;
+                narrow127) cidr=2a14:6781:a::8; prefix=127 ;;
+                hostonly) cidr=2a14:6781:000a:0000::9; prefix=128 ;;
+            esac
+            printf '[{"ifname":"eth0","addr_info":[{"family":"inet6","local":"%s","prefixlen":%s,"scope":"global"}]}]\n' "$cidr" "$prefix"
+            ;;
+        colored)
+            printf '\033[32m%s\033[0m\n' '[{"ifname":"eth0","addr_info":[{"family":"inet6","local":"2a14:6781:a::9","prefixlen":120,"scope":"global"}]}]'
+            ;;
+        *)
+            printf '%s\n' '[{"ifname":"eth0","addr_info":[{"family":"inet6","local":"2605:52c0:2:14b:be24:11ff:fe6e:d967","prefixlen":64,"scope":"global"}]}]'
+            ;;
+    esac
+fi
+STUB
+chmod 700 "$PODMAN_STATE_DIR/ip"
+export PATH="$PODMAN_STATE_DIR:$PATH"
 selected=$(select_public_ipv6_cidr)
 if [[ "$selected" != '2605:52c0:2:14b:be24:11ff:fe6e:d967/64' ]]; then
     printf 'normal /64 selection returned %q\n' "$selected" >&2
@@ -119,6 +161,7 @@ if [[ "$uplink" != eth0 ]]; then
     exit 1
 fi
 IPV6_TEST_SCENARIO=delegated
+export IPV6_TEST_SCENARIO
 selected=$(select_public_ipv6_cidr)
 if [[ "$selected" != '2a14:7c0:1002:10f8::1/38' ]]; then
     printf 'delegated /38 was hidden by an uplink /128: %q\n' "$selected" >&2
@@ -174,6 +217,12 @@ IPV6_TEST_SCENARIO=narrow127
 selected=$(select_public_ipv6_cidr)
 if [[ "$selected" != '2a14:6781:a::8/127' ]]; then
     printf 'routed /127 selection returned %q\n' "$selected" >&2
+    exit 1
+fi
+IPV6_TEST_SCENARIO=colored
+selected=$(select_public_ipv6_cidr)
+if [[ "$selected" != '2a14:6781:a::9/120' ]]; then
+    printf 'ANSI-colored JSON selection returned %q\n' "$selected" >&2
     exit 1
 fi
 unset IPV6_TEST_SCENARIO
@@ -285,7 +334,7 @@ if extract_function adapt_ipv6 | grep -Eq 'update_sysctl[[:space:]].*proxy_ndp';
     printf 'Podman IPv6 setup must not change global proxy_ndp state\n' >&2
     exit 1
 fi
-if ! grep -Fq '["ip", "-6", "route", "show", "default"]' "$installer"; then
+if ! grep -Fq 'ip_json("route", "show", "default")' "$installer"; then
     printf 'Podman routed IPv6 allocation must reserve the upstream default gateway\n' >&2
     exit 1
 fi

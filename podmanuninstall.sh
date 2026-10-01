@@ -59,8 +59,14 @@ is_project_ipv6_nat_helper() {
 }
 podman_ipv6_nat_state_is_safe() {
     local mode subnet
-    mode=$(tr -d '[:space:]' <"$(podman_state_file podman_ipv6_network_mode)" 2>/dev/null || true)
-    subnet=$(tr -d '[:space:]' <"$(podman_state_file podman_ipv6_subnet)" 2>/dev/null || true)
+    mode=""
+    if [[ -r "$(podman_state_file podman_ipv6_network_mode)" ]]; then
+        mode=$(tr -d '[:space:]' <"$(podman_state_file podman_ipv6_network_mode)" 2>/dev/null || true)
+    fi
+    subnet=""
+    if [[ -r "$(podman_state_file podman_ipv6_subnet)" ]]; then
+        subnet=$(tr -d '[:space:]' <"$(podman_state_file podman_ipv6_subnet)" 2>/dev/null || true)
+    fi
     [[ "$mode" == "nat" && -n "$subnet" ]] || return 1
     python3 - "$subnet" <<'PY'
 import ipaddress
@@ -71,6 +77,74 @@ except ValueError:
     raise SystemExit(1)
 raise SystemExit(0 if network.prefixlen == 64 and network.subnet_of(ipaddress.IPv6Network("fc00::/7")) else 1)
 PY
+}
+remove_podman_package() {
+    local status
+
+    if command -v dpkg-query >/dev/null 2>&1; then
+        status=$(dpkg-query -W -f='${db:Status-Abbrev}' podman 2>/dev/null || true)
+        if [[ "$status" == ii* ]]; then
+            command -v apt-get >/dev/null 2>&1 || {
+                _red "Podman is installed with dpkg, but apt-get is unavailable"
+                return 1
+            }
+            DEBIAN_FRONTEND=noninteractive apt-get -y purge podman || return 1
+            hash -r
+            if command -v podman >/dev/null 2>&1; then
+                _red "Podman package was purged, but the podman executable is still present"
+                return 1
+            fi
+            _green "  Podman package removed"
+            return 0
+        fi
+    fi
+
+    if command -v rpm >/dev/null 2>&1 && rpm -q podman >/dev/null 2>&1; then
+        if command -v dnf >/dev/null 2>&1; then
+            dnf -y remove --noautoremove podman || return 1
+        elif command -v yum >/dev/null 2>&1; then
+            yum -y remove podman || return 1
+        elif command -v zypper >/dev/null 2>&1; then
+            zypper --non-interactive remove --no-clean-deps podman || return 1
+        else
+            rpm -e podman || return 1
+        fi
+        hash -r
+        if command -v podman >/dev/null 2>&1; then
+            _red "Podman package was removed, but the podman executable is still present"
+            return 1
+        fi
+        _green "  Podman package removed"
+        return 0
+    fi
+
+    if command -v apk >/dev/null 2>&1 && apk info -e podman >/dev/null 2>&1; then
+        apk del podman || return 1
+        hash -r
+        if command -v podman >/dev/null 2>&1; then
+            _red "Podman package was removed, but the podman executable is still present"
+            return 1
+        fi
+        _green "  Podman package removed"
+        return 0
+    fi
+
+    if command -v pacman >/dev/null 2>&1 && pacman -Qq podman >/dev/null 2>&1; then
+        pacman -R --noconfirm podman || return 1
+        hash -r
+        if command -v podman >/dev/null 2>&1; then
+            _red "Podman package was removed, but the podman executable is still present"
+            return 1
+        fi
+        _green "  Podman package removed"
+        return 0
+    fi
+
+    if command -v podman >/dev/null 2>&1; then
+        _red "A podman executable remains, but no supported package manager reports an installed Podman package"
+        return 1
+    fi
+    _yellow "  Podman package is not installed; skipping package removal"
 }
 
 # Set when an installer-owned unmanaged bridge cannot be deleted safely. The
@@ -233,7 +307,10 @@ _blue "[5/7] 删除 Podman 网络..."
 # Only remove rules when the recorded installer state proves that this is our
 # private ULA NAT66 subnet.  Never delete a generic host IPv6 rule based only
 # on the presence of a similarly named network.
-podman_ipv6_subnet=$(tr -d '[:space:]' <"$(podman_state_file podman_ipv6_subnet)" 2>/dev/null || true)
+podman_ipv6_subnet=""
+if [[ -r "$(podman_state_file podman_ipv6_subnet)" ]]; then
+    podman_ipv6_subnet=$(tr -d '[:space:]' <"$(podman_state_file podman_ipv6_subnet)" 2>/dev/null || true)
+fi
 if podman_ipv6_nat_state_is_safe && command -v ip6tables >/dev/null 2>&1; then
     while ip6tables -t nat -D POSTROUTING -s "$podman_ipv6_subnet" ! -d "$podman_ipv6_subnet" -j MASQUERADE 2>/dev/null; do :; done
     while ip6tables -D FORWARD -s "$podman_ipv6_subnet" -j ACCEPT 2>/dev/null; do :; done
@@ -250,6 +327,10 @@ if command -v podman >/dev/null 2>&1; then
         fi
     done
 fi
+# Netavark writes this installer-owned profile even after the network object
+# has been removed. Leaving it behind makes a later runtime inherit stale
+# bridge metadata, so remove only the project-named profile.
+rm -f /etc/cni/net.d/87-podman-bridge.conflist
 # 删除由常规 Podman 网络留下的残留网桥。
 if ip link show podman-br0 >/dev/null 2>&1; then
     ip link set podman-br0 down 2>/dev/null || true
@@ -299,8 +380,15 @@ if [[ -f /usr/local/bin/podman_firewall_backend ]]; then
     fi
 fi
 
-# ======== 6. 删除状态/辅助文件 ========
-_blue "[6/7] 删除辅助状态文件..."
+# ======== 6. 删除 Podman 软件包 ========
+_blue "[6/8] 卸载 Podman 软件包..."
+if ! remove_podman_package; then
+    _red "Podman package removal failed; remaining cleanup is incomplete"
+    exit 1
+fi
+
+# ======== 7. 删除状态/辅助文件 ========
+_blue "[7/8] 删除辅助状态文件..."
 # 清理 btrfs loop（需要在删除状态文件之前读取）
 if [[ -f /usr/local/bin/podman_mount_point ]]; then
     _bt_mp=$(cat /usr/local/bin/podman_mount_point 2>/dev/null)
@@ -341,8 +429,8 @@ fi
 rm -f /tmp/spiritlhl_*.tar.gz 2>/dev/null || true
 rm -f /tmp/ssh_bash.sh /tmp/ssh_sh.sh 2>/dev/null || true
 
-# ======== 7. 清理 sysctl 配置（仅删除本脚本写入的条目） ========
-_blue "[7/7] 清理辅助配置..."
+# ======== 8. 清理 sysctl 配置（仅删除本脚本写入的条目） ========
+_blue "[8/8] 清理辅助配置..."
 # 注意：podman 使用了 /etc/sysctl.conf，不轻易删除整个文件
 # 仅提示用户手动检查
 _yellow "  提示：sysctl.conf 中的内核参数（ip_forward 等）未被清除，请手动检查 /etc/sysctl.conf"

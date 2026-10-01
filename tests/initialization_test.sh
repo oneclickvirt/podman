@@ -55,3 +55,8 @@ grep -Fq 'if ! mount "$loop_device" "$mount_point"' <<<"$podman_source" ||
 grep -Fq 'update_sysctl "net.ipv6.conf.all.forwarding=1" || return 1' <<<"$podman_source" ||
     fail 'Podman IPv6 forwarding failure must disable optional IPv6 cleanly'
 printf 'Podman installation fault-injection tests passed (4 scenarios)\n'
+grep -Fq '"ca-certificates"' "$repo_root/scripts/ssh_bash.sh" ||
+    fail 'Debian/RHEL guest bootstrap must install TLS root certificates'
+grep -Fq 'ca-certificates' "$repo_root/scripts/ssh_sh.sh" ||
+    fail 'Alpine guest bootstrap must install TLS root certificates'
+printf 'Podman guest TLS bootstrap contract passed\n'
