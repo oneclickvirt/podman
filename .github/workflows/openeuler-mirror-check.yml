@@ -1,0 +1,58 @@
+name: Measure public openEuler mirror throughput
+'on':
+  workflow_dispatch: {}
+permissions:
+  contents: read
+jobs:
+  probe:
+    strategy:
+      fail-fast: false
+      matrix:
+        runner:
+        - ubuntu-24.04
+        - ubuntu-24.04-arm
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 5
+    steps:
+    - name: Probe signed public repository mirrors
+      shell: python
+      run: |
+        import concurrent.futures
+        import json
+        import time
+        import urllib.request
+        import xml.etree.ElementTree as ET
+        import platform
+
+        arch = 'aarch64' if platform.machine() == 'aarch64' else 'x86_64'
+        roots = [
+            'https://repo.huaweicloud.com/openeuler/',
+            'https://mirrors.tuna.tsinghua.edu.cn/openeuler/',
+            'https://mirrors.nju.edu.cn/openeuler/',
+            'https://repo.openeuler.org/',
+        ]
+        def check(root):
+            base = root + 'openEuler-22.03-LTS-SP4/update/' + arch + '/'
+            started = time.monotonic()
+            try:
+                with urllib.request.urlopen(base + 'repodata/repomd.xml', timeout=20) as response:
+                    metadata = ET.fromstring(response.read(65536))
+                ns = {'r': 'http://linux.duke.edu/metadata/repo'}
+                location = metadata.find("r:data[@type='filelists']/r:location", ns).attrib['href']
+                request = urllib.request.Request(base + location, headers={'Range':'bytes=0-8388607'})
+                transfer = time.monotonic()
+                received = 0
+                with urllib.request.urlopen(request, timeout=20) as response:
+                    while received < 8388608 and time.monotonic() - transfer < 35:
+                        block = response.read(min(262144, 8388608 - received))
+                        if not block:
+                            break
+                        received += len(block)
+                elapsed = time.monotonic() - transfer
+                return {'root':root, 'arch':arch, 'bytes':received, 'transfer_seconds':round(elapsed,2),
+                        'bytes_per_second':round(received / elapsed), 'total_seconds':round(time.monotonic()-started,2)}
+            except Exception as error:
+                return {'root':root, 'arch':arch, 'error':type(error).__name__, 'seconds':round(time.monotonic()-started,2)}
+        with concurrent.futures.ThreadPoolExecutor(max_workers=4) as pool:
+            for result in pool.map(check, roots):
+                print('MIRROR_RESULT ' + json.dumps(result), flush=True)
