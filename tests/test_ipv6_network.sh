@@ -110,6 +110,9 @@ ip() {
         printf '%s\n' '2605:52c0:2:14b::/64 dev eth0 proto kernel'
     fi
 }
+# ShellCheck 0.9 treats the later cat mock as a call even with command.
+# This fixture deliberately uses the host cat before installing mocks.
+# shellcheck disable=SC2218
 command cat >"$PODMAN_STATE_DIR/ip" <<'STUB'
 #!/bin/sh
 if [ "${1:-}" != "-j" ]; then exit 2; fi
