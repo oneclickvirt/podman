@@ -110,7 +110,7 @@ ip() {
         printf '%s\n' '2605:52c0:2:14b::/64 dev eth0 proto kernel'
     fi
 }
-cat >"$PODMAN_STATE_DIR/ip" <<'STUB'
+command cat >"$PODMAN_STATE_DIR/ip" <<'STUB'
 #!/bin/sh
 if [ "${1:-}" != "-j" ]; then exit 2; fi
 if [ "${2:-}" = "-d" ]; then
@@ -868,6 +868,7 @@ ip() {
             ;;
     esac
 }
+# shellcheck disable=SC2120 # Arguments are passed by the dynamically loaded bridge helper.
 cat() {
     [[ "$1" == '/usr/local/bin/podman_ipv6_bridge_owned' ]] && {
         printf '%s\n' true
