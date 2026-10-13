@@ -96,7 +96,9 @@ run_package_case() {
         apk) ;;
         pacman) ;;
     esac
-    PATH="$test_bin:$PATH" remove_podman_package
+    # Hosted runners may already have Podman or another package manager.
+    # The removal fixture must not fall through to those real installations.
+    PATH="$test_bin" remove_podman_package
     [[ ! -e "$test_bin/podman" ]] || {
         printf 'Podman executable remained in %s case\n' "$backend-$manager" >&2
         exit 1
