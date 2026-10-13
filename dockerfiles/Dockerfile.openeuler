@@ -1,11 +1,13 @@
 FROM openeuler/openeuler:22.03
 
-# The base image's metalink endpoints return 404. Use its HTTPS base URLs
-# and keep RPM signatures enabled; build binary packages without source/debug
-# repository metadata. Bound both transactions so a stalled mirror fails.
-RUN sed -i -e '/^metalink=/d' -e 's|^gpgkey=http:|gpgkey=https:|' /etc/yum.repos.d/openEuler.repo && \
-    timeout 20m dnf --disablerepo=debuginfo,source,update-source --setopt=timeout=30 --setopt=retries=3 --setopt=minrate=10240 update -y && \
-    timeout 20m dnf --disablerepo=debuginfo,source,update-source --setopt=timeout=30 --setopt=retries=3 --setopt=minrate=10240 install -y \
+# Native GitHub runner probes verified Huawei, NJU and TUNA throughput.
+# DNF can fall back across HTTPS mirrors, and still verifies every RPM using
+# the original upstream signing key. Do not ignore update/install failures.
+COPY configure_openeuler_repositories.py /tmp/configure_openeuler_repositories.py
+RUN python3 /tmp/configure_openeuler_repositories.py /etc/yum.repos.d/openEuler.repo && \
+    rm /tmp/configure_openeuler_repositories.py && \
+    timeout --kill-after=30s 45m dnf --setopt=timeout=30 --setopt=retries=3 --setopt=minrate=65536 --setopt=max_parallel_downloads=10 update -y && \
+    timeout --kill-after=30s 45m dnf --setopt=timeout=30 --setopt=retries=3 --setopt=minrate=65536 --setopt=max_parallel_downloads=10 install -y \
         openssh-server \
         sudo \
         curl \

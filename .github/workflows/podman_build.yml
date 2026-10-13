@@ -185,6 +185,10 @@ jobs:
         make_latest: false
       env:
         GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+    defaults:
+      run:
+        shell: bash
+    needs: script-regression
   manifest:
     name: Create multi-arch manifest for ${{ matrix.os }}
     needs: build
@@ -243,6 +247,9 @@ jobs:
         # 推送 manifest
         podman manifest push "${MANIFEST}" "${MANIFEST}"
         echo "Multi-arch manifest pushed: ${MANIFEST}"
+    defaults:
+      run:
+        shell: bash
 'on':
   schedule:
   - cron: 0 15 * * *
