@@ -1,7 +1,11 @@
 FROM openeuler/openeuler:22.03
 
-RUN dnf update -y && \
-    dnf install -y \
+# The base image's metalink endpoints return 404. Use its HTTPS base URLs
+# and keep RPM signatures enabled; build binary packages without source/debug
+# repository metadata. Bound both transactions so a stalled mirror fails.
+RUN sed -i -e '/^metalink=/d' -e 's|^gpgkey=http:|gpgkey=https:|' /etc/yum.repos.d/openEuler.repo && \
+    timeout 20m dnf --disablerepo=debuginfo,source,update-source --setopt=timeout=30 --setopt=retries=3 --setopt=minrate=10240 update -y && \
+    timeout 20m dnf --disablerepo=debuginfo,source,update-source --setopt=timeout=30 --setopt=retries=3 --setopt=minrate=10240 install -y \
         openssh-server \
         sudo \
         curl \
