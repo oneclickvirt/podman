@@ -1960,6 +1960,11 @@ attach_one_locked() {
     nsenter -t "$pid" -n ip -6 addr replace "$address/128" dev "$iface" || return 1
     nsenter -t "$pid" -n ip -6 route replace default via "$gateway" dev "$iface" || return 1
     ip -6 route replace "$address/128" dev "$bridge" || return 1
+    # Podman can recreate the veth with a different MAC on each start.
+    # A neighbour entry for the previous namespace can remain STALE/FAILED
+    # even though the /128 route is correct. Invalidate only this guest entry
+    # when repairing its attachment, never the entire bridge neighbour table.
+    ip -6 neigh flush to "$address/128" dev "$bridge" || return 1
     replace_mapping "$name" "$address" || return 1
     printf '%s\n' "$address"
 }
