@@ -1664,7 +1664,7 @@ gateway_file="${state_dir}/podman_ipv6_manual_gateway"
 bridge_file="${state_dir}/podman_ipv6_manual_bridge"
 map_file="${state_dir}/podman_ipv6_allocations"
 target_file="${state_dir}/podman_ipv6_targets"
-lock_dir="${map_file}.lock"
+lock_file="${map_file}.flock"
 
 fail() { printf '%s\n' "$*" >&2; return 1; }
 valid_name() { [[ "${1:-}" =~ ^[a-zA-Z0-9][a-zA-Z0-9_.-]*$ ]]; }
@@ -1824,16 +1824,18 @@ sync_targets() {
     fi
 }
 acquire_lock() {
-    local attempt
-    for attempt in 1 2 3 4 5 6 7 8 9 10; do
-        mkdir "$lock_dir" 2>/dev/null && return 0
-        sleep 0.1
-    done
+    command -v flock >/dev/null 2>&1 || { fail 'Podman IPv6 allocation requires flock (util-linux)'; return 1; }
+    # Kernel locks are released even after SIGKILL or host reset. Do not
+    # unlink this file: concurrent callers must lock the same inode.
+    exec 9>"$lock_file" || return 1
+    flock -w 10 9 && return 0
+    exec 9>&-
     printf 'Timed out waiting for the Podman IPv6 allocation lock\n' >&2
     return 1
 }
 release_lock() {
-    rmdir "$lock_dir" 2>/dev/null || true
+    flock -u 9
+    exec 9>&-
 }
 find_container_iface() {
     local name="$1" pid="$2" ula
@@ -2632,6 +2634,7 @@ start_ndpresponder() {
             ndp_status=$(podman inspect -f '{{.State.Status}}' ndpresponder 2>/dev/null || true)
             if [[ "$ndp_status" == "running" && -s "$ndp_ready_file" ]]; then
                 printf '%s\n' true > "$(podman_state_file podman_ipv6_ndp_ready_required)"
+                install_ndpresponder_boot_service || return 1
                 _green "NDP responder started and is ready for IPv6 neighbor discovery"
                 return 0
             fi
@@ -2647,6 +2650,33 @@ start_ndpresponder() {
     : > "$ndp_ready_file" 2>/dev/null || true
     rm -f "$(podman_state_file podman_ipv6_ndp_ready_required)"
     return 1
+}
+install_ndpresponder_boot_service() {
+    command -v systemctl >/dev/null 2>&1 || return 0
+    # Vendor podman-restart.service commonly selects only restart=always.
+    # Keep the responder's bounded on-failure policy and explicitly restore
+    # this installer-owned container at boot.
+    local podman_path
+    podman_path=$(command -v podman) || return 1
+    cat > /etc/systemd/system/oneclickvirt-podman-ndp.service <<EOF
+[Unit]
+Description=OneClickVirt Podman NDP responder boot restore
+After=network-online.target podman.socket podman-restart.service
+Wants=network-online.target podman.socket
+Before=podman-ipv6-attach.service
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=${podman_path} start ndpresponder
+ExecStop=${podman_path} stop -t 10 ndpresponder
+TimeoutStartSec=60
+TimeoutStopSec=30
+
+[Install]
+WantedBy=multi-user.target
+EOF
+    systemctl daemon-reload && systemctl enable --now oneclickvirt-podman-ndp.service
 }
 # ======== 配置 podman.socket 服务（可选，供 API 使用） ========
 systemd_unit_exists() {

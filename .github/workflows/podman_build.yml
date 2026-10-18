@@ -28,6 +28,7 @@ jobs:
         # external commands with function mocks, which ShellCheck cannot
         # statically trace on the Ubuntu runner.
         shellcheck -e SC2317 tests/test_ipv6_network.sh
+        bash tests/test_ipv6_allocation_lock.sh
         bash tests/test_ipv6_network.sh
         bash tests/test_ssh_ipv6_listener.sh
         bash tests/host_ipv6_preservation_test.sh

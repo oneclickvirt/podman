@@ -603,6 +603,11 @@ fi
 eval "$(extract_function resolve_ndpresponder_image)"
 # shellcheck disable=SC1090 # The test intentionally loads the installer function.
 eval "$(extract_function start_ndpresponder)"
+# System service installation is exercised on the bare-metal host; this
+# image-selection fixture must not write to the test host's /etc/systemd.
+# shellcheck disable=SC2329
+install_ndpresponder_boot_service() { :; }
+
 # NAT66 has no public container addresses to proxy. It must be considered
 # healthy without opening a Podman API socket or starting a responder process.
 printf '%s\n' nat >"$(podman_state_file podman_ipv6_network_mode)"

@@ -218,6 +218,12 @@ fi
 
 # ======== 3. 停止 ndpresponder ========
 _blue "[3/7] 停止 ndpresponder..."
+if command -v systemctl >/dev/null 2>&1 &&
+   grep -qF 'Description=OneClickVirt Podman NDP responder boot restore' /etc/systemd/system/oneclickvirt-podman-ndp.service 2>/dev/null; then
+    systemctl disable --now oneclickvirt-podman-ndp.service 2>/dev/null || true
+    rm -f /etc/systemd/system/oneclickvirt-podman-ndp.service
+    systemctl daemon-reload 2>/dev/null || true
+fi
 if command -v podman >/dev/null 2>&1; then
     podman rm -f ndpresponder 2>/dev/null || true
 fi
