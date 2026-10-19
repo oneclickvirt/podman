@@ -33,6 +33,7 @@ jobs:
       run: |
         set -euo pipefail
         bash tests/test_ipv6_allocation_lock.sh
+        bash tests/test_ipv6_isolation_watcher.sh
         bash tests/test_ipv6_network.sh
         bash tests/initialization_test.sh
         bash tests/noninteractive_mode_test.sh

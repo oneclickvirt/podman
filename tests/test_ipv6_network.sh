@@ -832,6 +832,11 @@ if ! grep -Fq 'net_opts="--network podman-net --network podman-ipv6"' "$repo_roo
     printf 'unmanaged IPv6 containers must attach podman-net before podman-ipv6\n' >&2
     exit 1
 fi
+if ! grep -Fq 'ipv4_isolation_opts="--label oneclickvirt.network.ipv6-no-ipv4=true"' "$repo_root/scripts/onepodman.sh" || \
+   ! grep -Fq 'install_podman_ipv6_isolation_watcher' "$installer"; then
+    printf 'secondary IPv6 network IPv4 isolation is not persisted across container restarts\n' >&2
+    exit 1
+fi
 
 # A bridge creation that fails after adding a new bridge must run the same
 # ownership-aware cleanup used for a failed Podman network creation.
@@ -884,6 +889,7 @@ cat() {
     }
     command cat "$@"
 }
+# shellcheck disable=SC2329 # Called by the dynamically sourced bridge helper.
 podman() {
     [[ "$*" == 'network exists podman-ipv6' ]] && return 1
     printf 'unexpected podman invocation while checking retained bridge: %s\n' "$*" >&2
@@ -911,5 +917,72 @@ if [[ "$manual_existing_branch" == *'[[ ! -x /usr/local/bin/podman-ipv6-attach.s
     printf 'existing manual Podman IPv6 networks do not refresh the attach helper\n' >&2
     exit 1
 fi
+
+extract_script_function() {
+    local name="$1"
+    awk -v name="$name" '
+        $0 == name "() {" { printing = 1 }
+        printing {
+            print
+            if ($0 == "}") exit
+        }
+    ' "$repo_root/scripts/onepodman.sh"
+}
+# shellcheck disable=SC1090 # The test intentionally loads a pure script helper.
+eval "$(extract_script_function build_publish_options)"
+[[ "$(build_publish_options 22002 34975 34975)" == '-p 22002:22 -p 34975:34975' ]] || {
+    printf 'single-port Podman publish range uses invalid range syntax\n' >&2
+    exit 1
+}
+[[ "$(build_publish_options 22002 34975 34976)" == '-p 22002:22 -p 34975-34976:34975-34976' ]] || {
+    printf 'multi-port Podman publish range changed unexpectedly\n' >&2
+    exit 1
+}
+# shellcheck disable=SC1090 # The test intentionally loads one pure-script helper.
+eval "$(extract_script_function remove_ipv4_from_ipv6_attachment)"
+isolation_route_present=true
+isolation_address_present=true
+# shellcheck disable=SC2329 # Called by the dynamically sourced helper.
+podman() {
+    case "$*" in
+        *'.IPAddress'*) printf '%s\n' '10.89.0.8/24' ;;
+        *'.State.Pid'*) printf '%s\n' '1234' ;;
+        *'.Gateway'*) printf '%s\n' '10.89.0.1' ;;
+        *) printf 'unexpected Podman isolation call: %s\n' "$*" >&2; return 1 ;;
+    esac
+}
+nsenter() {
+    case "$*" in
+        *'ip -o -4 addr show dev eth1'*)
+            [[ "$isolation_address_present" == true ]] && printf '%s\n' '2: eth1 inet 10.89.0.8/24 scope global' || true
+            ;;
+        *'ip -o -4 addr show'*)
+            [[ "$isolation_address_present" == true ]] && printf '%s\n' '2: eth1 inet 10.89.0.8/24 scope global' || true
+            ;;
+        *'ip -4 route show default dev eth1'*)
+            [[ "$isolation_route_present" == true ]] && printf '%s\n' 'default via 10.89.0.1 dev eth1' || true
+            ;;
+        *'ip -4 route show default'*)
+            [[ "$isolation_route_present" == true ]] && printf '%s\n' 'default via 10.89.0.1 dev eth1' || true
+            ;;
+        *'ip -4 route del default dev eth1'*) isolation_route_present=false ;;
+        *'ip -4 addr del 10.89.0.8/24 dev eth1'*) isolation_address_present=false ;;
+        *) printf 'unexpected nsenter isolation call: %s\n' "$*" >&2; return 1 ;;
+    esac
+}
+remove_ipv4_from_ipv6_attachment isolated-test || {
+    printf 'pure Podman script failed to isolate the IPv6 attachment IPv4\n' >&2
+    exit 1
+}
+[[ "$isolation_route_present" == false && "$isolation_address_present" == false ]] || {
+    printf 'pure Podman script left the IPv6 attachment IPv4 state behind\n' >&2
+    exit 1
+}
+remove_ipv4_from_ipv6_attachment isolated-test || {
+    printf 'pure Podman IPv6 isolation helper is not idempotent\n' >&2
+    exit 1
+}
+
+bash "$repo_root/tests/test_ipv6_isolation_watcher.sh"
 
 printf 'podman IPv6 network candidate tests passed\n'

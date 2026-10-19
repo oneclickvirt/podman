@@ -45,6 +45,10 @@ is_project_ipv6_attach_unit() {
     local unit_file="/etc/systemd/system/podman-ipv6-attach.service"
     [[ -f "$unit_file" ]] && grep -q "Restore OneClickVirt Podman routed IPv6 addresses" "$unit_file" 2>/dev/null
 }
+is_project_ipv6_isolate_unit() {
+    local unit_file="/etc/systemd/system/podman-ipv6-isolate.service"
+    [[ -f "$unit_file" ]] && grep -q "Restore OneClickVirt Podman IPv6-only network isolation" "$unit_file" 2>/dev/null
+}
 is_project_ipv6_nat_unit() {
     local unit_file="/etc/systemd/system/podman-ipv6-nat.service"
     [[ -f "$unit_file" ]] && grep -q "Restore OneClickVirt Podman IPv6 NAT66 rules" "$unit_file" 2>/dev/null
@@ -267,6 +271,15 @@ if command -v systemctl >/dev/null 2>&1; then
             systemctl disable podman-ipv6-attach 2>/dev/null || true
         fi
     fi
+    if is_project_ipv6_isolate_unit; then
+        if systemctl is-active --quiet podman-ipv6-isolate 2>/dev/null; then
+            systemctl stop podman-ipv6-isolate 2>/dev/null || true
+            _yellow "  已停止 podman-ipv6-isolate"
+        fi
+        if systemctl is-enabled --quiet podman-ipv6-isolate 2>/dev/null; then
+            systemctl disable podman-ipv6-isolate 2>/dev/null || true
+        fi
+    fi
     if is_project_ipv6_nat_unit; then
         if systemctl is-active --quiet podman-ipv6-nat 2>/dev/null; then
             systemctl stop podman-ipv6-nat 2>/dev/null || true
@@ -289,6 +302,10 @@ if is_project_ipv6_bridge_unit; then
 fi
 f=/etc/systemd/system/podman-ipv6-attach.service
 if is_project_ipv6_attach_unit; then
+    rm -f "$f" && _yellow "  删除 $f"
+fi
+f=/etc/systemd/system/podman-ipv6-isolate.service
+if is_project_ipv6_isolate_unit; then
     rm -f "$f" && _yellow "  删除 $f"
 fi
 f=/etc/systemd/system/podman-ipv6-nat.service
@@ -428,6 +445,9 @@ for f in "${PODMAN_STATE_DIR%/}"/podman_*; do
 done
 [[ -f /usr/local/bin/podman-ipv6-bridge.sh ]] && rm -f /usr/local/bin/podman-ipv6-bridge.sh && _yellow "  删除 /usr/local/bin/podman-ipv6-bridge.sh"
 [[ -f /usr/local/bin/podman-ipv6-attach.sh ]] && rm -f /usr/local/bin/podman-ipv6-attach.sh && _yellow "  删除 /usr/local/bin/podman-ipv6-attach.sh"
+if is_project_ipv6_isolate_unit || [[ -f /usr/local/bin/podman-ipv6-isolate.sh ]]; then
+    rm -f /usr/local/bin/podman-ipv6-isolate.sh && _yellow "  删除 /usr/local/bin/podman-ipv6-isolate.sh"
+fi
 if is_project_ipv6_nat_helper; then
     rm -f /usr/local/bin/podman-ipv6-nat.sh && _yellow "  删除 /usr/local/bin/podman-ipv6-nat.sh"
 fi

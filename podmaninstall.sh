@@ -1109,6 +1109,111 @@ create_podman_network() {
         return 1
     fi
 }
+
+install_podman_ipv6_isolation_watcher() {
+    local helper=/usr/local/bin/podman-ipv6-isolate.sh
+    cat >"$helper" <<'EOF'
+#!/bin/bash
+set -u
+runtime=podman
+label=oneclickvirt.network.ipv6-no-ipv4
+
+isolate_one() {
+    local container="$1" ipv4_cidr pid gateway addresses routes iface attempt
+    for attempt in {1..20}; do
+        ipv4_cidr=$($runtime inspect "$container" --format '{{with index .NetworkSettings.Networks "podman-ipv6"}}{{if .IPAddress}}{{.IPAddress}}/{{.IPPrefixLen}}{{end}}{{end}}' 2>/dev/null || true)
+        if [[ -z "$ipv4_cidr" ]]; then
+            sleep 0.25
+            continue
+        fi
+        pid=$($runtime inspect "$container" --format '{{.State.Pid}}' 2>/dev/null || true)
+        [[ "$pid" =~ ^[1-9][0-9]*$ ]] || { sleep 0.25; continue; }
+        gateway=$($runtime inspect "$container" --format '{{with index .NetworkSettings.Networks "podman-ipv6"}}{{.Gateway}}{{end}}' 2>/dev/null || true)
+        addresses=$(nsenter -t "$pid" -n ip -o -4 addr show 2>/dev/null) || { sleep 0.25; continue; }
+        routes=$(nsenter -t "$pid" -n ip -4 route show default 2>/dev/null) || { sleep 0.25; continue; }
+        iface=$(printf '%s\n' "$addresses" | awk -v cidr="$ipv4_cidr" '$4 == cidr {print $2; exit}')
+        iface=${iface%%@*}
+        if [[ -z "$iface" && -n "$gateway" ]]; then
+            iface=$(printf '%s\n' "$routes" | awk -v gateway="$gateway" '$1 == "default" && $2 == "via" && $3 == gateway {for (i = 1; i <= NF; i++) if ($i == "dev") {print $(i + 1); exit}}')
+        fi
+        if [[ -z "$iface" ]]; then
+            if printf '%s\n' "$addresses" | awk -v cidr="$ipv4_cidr" '$4 == cidr {found=1} END {exit !found}'; then
+                printf 'IPv4 address has no interface for container %s\n' "$container" >&2
+                return 1
+            fi
+            if [[ -n "$gateway" ]] && printf '%s\n' "$routes" | awk -v gateway="$gateway" '$1 == "default" && $2 == "via" && $3 == gateway {found=1} END {exit !found}'; then
+                printf 'IPv4 default route has no interface for container %s\n' "$container" >&2
+                return 1
+            fi
+            return 0
+        fi
+        while nsenter -t "$pid" -n ip -4 route show default dev "$iface" 2>/dev/null | grep -q .; do
+            nsenter -t "$pid" -n ip -4 route del default dev "$iface" 2>/dev/null || break
+        done
+        nsenter -t "$pid" -n ip -4 addr del "$ipv4_cidr" dev "$iface" 2>/dev/null || true
+        ! nsenter -t "$pid" -n ip -o -4 addr show dev "$iface" 2>/dev/null | awk -v cidr="$ipv4_cidr" '$4 == cidr {found=1} END {exit !found}' || return 1
+        ! nsenter -t "$pid" -n ip -4 route show default dev "$iface" 2>/dev/null | grep -q . || return 1
+        return 0
+    done
+    printf 'Timed out waiting for Podman IPv6 network on container %s\n' "$container" >&2
+    return 1
+}
+
+restore_all() {
+    local container
+    while IFS= read -r container; do
+        [[ -n "$container" ]] || continue
+        isolate_or_stop "$container" || true
+    done < <($runtime ps -q --filter "label=${label}=true" 2>/dev/null || true)
+}
+
+isolate_or_stop() {
+    local container="$1"
+    isolate_one "$container" && return 0
+    printf 'IPv4 isolation failed for container %s; stopping it to avoid an unintended IPv4 route\n' "$container" >&2
+    $runtime stop "$container" >/dev/null 2>&1 || \
+        printf 'Failed to stop container %s after IPv4 isolation failed\n' "$container" >&2
+    return 1
+}
+
+if [[ "${1:-}" == "--watch" ]]; then
+    restore_all
+    $runtime events --since 1m --filter type=container --filter event=start --format '{{.ID}}' 2>/dev/null |
+        while IFS= read -r container; do
+            [[ -n "$container" ]] || continue
+            value=$($runtime inspect "$container" --format "{{index .Config.Labels \"${label}\"}}" 2>/dev/null || true)
+            [[ "$value" == true ]] && isolate_or_stop "$container" || true
+        done
+else
+    [[ -n "${1:-}" ]] || exit 2
+    isolate_one "$1"
+fi
+EOF
+    chmod 700 "$helper"
+    if ! command -v systemctl >/dev/null 2>&1; then
+        _yellow "No systemd detected; IPv6-network IPv4 isolation will run during instance creation but not from the restart watcher"
+        return 0
+    fi
+    cat >/etc/systemd/system/podman-ipv6-isolate.service <<'EOF'
+[Unit]
+Description=Restore OneClickVirt Podman IPv6-only network isolation
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+ExecStart=/usr/local/bin/podman-ipv6-isolate.sh --watch
+Restart=always
+RestartSec=2
+
+[Install]
+WantedBy=multi-user.target
+EOF
+    systemctl daemon-reload 2>/dev/null || true
+    systemctl enable --now podman-ipv6-isolate.service 2>/dev/null || \
+        _yellow "Could not start Podman IPv6 isolation watcher; explicit provider and script start operations still restore the network"
+}
+
 # ======== 配置 IPv6 内核参数 ========
 adapt_ipv6() {
     local uplink
@@ -2912,7 +3017,8 @@ main() {
         if adapt_ipv6 && \
            create_ipv6_network "$IPV6_CIDR" && \
            configure_podman_ipv6_ndp_state && \
-           start_ndpresponder; then
+           start_ndpresponder && \
+           install_podman_ipv6_isolation_watcher; then
             echo "true" > "$(podman_state_file podman_ipv6_enabled)"
         else
             echo "false" > "$(podman_state_file podman_ipv6_enabled)"

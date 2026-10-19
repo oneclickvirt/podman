@@ -97,6 +97,17 @@ validate_port() {
     [[ "$value" =~ ^[0-9]+$ ]] && (( value >= 1 && value <= 65535 ))
 }
 
+build_publish_options() {
+    local ssh_port="$1" start_port="$2" end_port="$3"
+    local options="-p ${ssh_port}:22"
+    if [[ "$start_port" == "$end_port" ]]; then
+        options+=" -p ${start_port}:${end_port}"
+    else
+        options+=" -p ${start_port}-${end_port}:${start_port}-${end_port}"
+    fi
+    printf '%s\n' "$options"
+}
+
 mark_used_port_range() {
     local start="$1"
     local end="$2"
@@ -620,6 +631,39 @@ apply_btrfs_disk_limit() {
     return 0
 }
 
+remove_ipv4_from_ipv6_attachment() {
+    local cname="$1"
+    local ipv4_cidr pid gateway iface
+    ipv4_cidr=$(podman inspect "$cname" --format '{{with index .NetworkSettings.Networks "podman-ipv6"}}{{if .IPAddress}}{{.IPAddress}}/{{.IPPrefixLen}}{{end}}{{end}}') || return 1
+    [[ -n "$ipv4_cidr" ]] || return 0
+    [[ "$ipv4_cidr" =~ ^[0-9./]+$ && "$ipv4_cidr" == */* ]] || return 1
+    pid=$(podman inspect "$cname" --format '{{.State.Pid}}') || return 1
+    [[ "$pid" =~ ^[1-9][0-9]*$ ]] || return 1
+    gateway=$(podman inspect "$cname" --format '{{with index .NetworkSettings.Networks "podman-ipv6"}}{{.Gateway}}{{end}}') || return 1
+    local addresses routes
+    addresses=$(nsenter -t "$pid" -n ip -o -4 addr show) || return 1
+    routes=$(nsenter -t "$pid" -n ip -4 route show default) || return 1
+    iface=$(printf '%s\n' "$addresses" | awk -v cidr="$ipv4_cidr" '$4 == cidr {print $2; exit}')
+    iface=${iface%%@*}
+    if [[ -z "$iface" && -n "$gateway" ]]; then
+        iface=$(printf '%s\n' "$routes" | awk -v gateway="$gateway" '$1 == "default" && $2 == "via" && $3 == gateway {for (i = 1; i <= NF; i++) if ($i == "dev") {print $(i + 1); exit}}')
+    fi
+    if [[ -z "$iface" ]]; then
+        ! printf '%s\n' "$addresses" | awk -v cidr="$ipv4_cidr" '$4 == cidr {found=1} END {exit !found}' || return 1
+        if [[ -n "$gateway" ]]; then
+            ! printf '%s\n' "$routes" | awk -v gateway="$gateway" '$1 == "default" && $2 == "via" && $3 == gateway {found=1} END {exit !found}' || return 1
+        fi
+        return 0
+    fi
+
+    while nsenter -t "$pid" -n ip -4 route show default dev "$iface" | grep -q .; do
+        nsenter -t "$pid" -n ip -4 route del default dev "$iface" 2>/dev/null || break
+    done
+    nsenter -t "$pid" -n ip -4 addr del "$ipv4_cidr" dev "$iface" 2>/dev/null || true
+    ! nsenter -t "$pid" -n ip -o -4 addr show dev "$iface" | awk -v cidr="$ipv4_cidr" '$4 == cidr {found=1} END {exit !found}' || return 1
+    ! nsenter -t "$pid" -n ip -4 route show default dev "$iface" | grep -q . || return 1
+}
+
 # ======== 主逻辑 ========
 main() {
     _blue "Creating container: name=${name} cpu=${cpu} memory=${memory}MB system=${system}"
@@ -629,9 +673,11 @@ main() {
 
     # 网络选项
     local net_opts=""
+    local ipv4_isolation_opts=""
     local ipv6_env=""
     local pod_opts=""
-    local publish_opts="-p ${sshport}:22 -p ${startport}-${endport}:${startport}-${endport}"
+    local publish_opts
+    publish_opts=$(build_publish_options "$sshport" "$startport" "$endport")
     if [[ "$ROOTLESS_MODE" == "true" ]]; then
         net_opts=""
         ipv6_env=""
@@ -644,6 +690,7 @@ main() {
             # The unmanaged network supplies the public IPv6 route.  Keep the
             # managed IPv4 network first so Podman retains NAT and -p forwarding.
             net_opts="--network podman-net --network podman-ipv6"
+            ipv4_isolation_opts="--label oneclickvirt.network.ipv6-no-ipv4=true"
         else
             net_opts="--network podman-ipv6"
         fi
@@ -657,6 +704,10 @@ main() {
     fi
 
     if [[ -n "${PODMAN_POD_NAME:-}" ]]; then
+        if [[ -n "$ipv4_isolation_opts" ]]; then
+            _red "Podman pod mode cannot safely isolate the secondary IPv6 network's IPv4 address"
+            exit 1
+        fi
         if [[ ! "$PODMAN_POD_NAME" =~ ^[a-zA-Z0-9][a-zA-Z0-9_.-]*$ ]]; then
             _red "Invalid PODMAN_POD_NAME: ${PODMAN_POD_NAME}"
             exit 1
@@ -708,6 +759,7 @@ main() {
         --memory="${memory}m" \
         --memory-swap="${memory}m" \
         --name "${name}" \
+        ${ipv4_isolation_opts} \
         ${pod_opts} \
         ${net_opts} \
         ${publish_opts} \
@@ -730,6 +782,15 @@ main() {
         if ! podman start "$name" >/dev/null; then
             podman rm -f "$name" >/dev/null 2>&1 || true
             _red "Failed to start container ${name} after applying the disk limit"
+            exit 1
+        fi
+    fi
+
+    if [[ "$ROOTLESS_MODE" != "true" && "$independent_ipv6" == "y" && "$IPV6_ENABLED" == "true" && \
+          ("$IPV6_NETWORK_MODE" == "unmanaged" || "$IPV6_NETWORK_MODE" == "manual") ]]; then
+        if ! remove_ipv4_from_ipv6_attachment "$name"; then
+            podman rm -f "$name" >/dev/null 2>&1 || true
+            _red "Failed to isolate IPv4 on the secondary Podman IPv6 network"
             exit 1
         fi
     fi
