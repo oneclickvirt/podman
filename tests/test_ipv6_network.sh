@@ -954,16 +954,24 @@ podman() {
 nsenter() {
     case "$*" in
         *'ip -o -4 addr show dev eth1'*)
-            [[ "$isolation_address_present" == true ]] && printf '%s\n' '2: eth1 inet 10.89.0.8/24 scope global' || true
+            if [[ "$isolation_address_present" == true ]]; then
+                printf '%s\n' '2: eth1 inet 10.89.0.8/24 scope global'
+            fi
             ;;
         *'ip -o -4 addr show'*)
-            [[ "$isolation_address_present" == true ]] && printf '%s\n' '2: eth1 inet 10.89.0.8/24 scope global' || true
+            if [[ "$isolation_address_present" == true ]]; then
+                printf '%s\n' '2: eth1 inet 10.89.0.8/24 scope global'
+            fi
             ;;
         *'ip -4 route show default dev eth1'*)
-            [[ "$isolation_route_present" == true ]] && printf '%s\n' 'default via 10.89.0.1 dev eth1' || true
+            if [[ "$isolation_route_present" == true ]]; then
+                printf '%s\n' 'default via 10.89.0.1 dev eth1'
+            fi
             ;;
         *'ip -4 route show default'*)
-            [[ "$isolation_route_present" == true ]] && printf '%s\n' 'default via 10.89.0.1 dev eth1' || true
+            if [[ "$isolation_route_present" == true ]]; then
+                printf '%s\n' 'default via 10.89.0.1 dev eth1'
+            fi
             ;;
         *'ip -4 route del default dev eth1'*) isolation_route_present=false ;;
         *'ip -4 addr del 10.89.0.8/24 dev eth1'*) isolation_address_present=false ;;
