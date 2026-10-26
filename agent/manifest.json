@@ -1,0 +1,11 @@
+{
+  "repository": "oneclickvirt/podman",
+  "skill_name": "oneclickvirt-podman",
+  "mcp": true,
+  "files": {
+    "agent/profile.json": "8e9224575221f38e58d361a3d6d92d5f6a6bf28189eaece02a52e32b7a3dd95d",
+    "skills/oneclickvirt-podman/SKILL.md": "2731e8d74b078842820ff65021a278d81724a0b0f574200a2a9468af7ff3a653",
+    "skills/oneclickvirt-podman/SKILL_ZH.md": "7741bf5093171fbf3507357b8039a385e2a7e3ffe1f7b61e5ca7c71b9c1574b1",
+    "agent/server.py": "d01416e6194095d90bf0d49ea29f7122969f0b74cf4d74ed0b1ce78753423a7d"
+  }
+}
